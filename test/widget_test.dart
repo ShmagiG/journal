@@ -1,30 +1,58 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
+import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:journal/data/database.dart';
 import 'package:journal/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  group('AppDatabase', () {
+    late AppDatabase db;
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    setUp(() => db = AppDatabase(NativeDatabase.memory()));
+    tearDown(() => db.close());
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+    test('upsertEntry stores and entryForDate reads it back', () async {
+      final day = DateTime(2026, 7, 10);
+      await db.upsertEntry(day, 'Hello journal');
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+      final entry = await db.entryForDate(day);
+      expect(entry, isNotNull);
+      expect(entry!.body, 'Hello journal');
+    });
+
+    test('re-saving the same day updates rather than duplicates', () async {
+      final day = DateTime(2026, 7, 10);
+      await db.upsertEntry(day, 'first');
+      await db.upsertEntry(day, 'second');
+
+      final entries = await db.watchEntries().first;
+      expect(entries, hasLength(1));
+      expect(entries.single.body, 'second');
+    });
+
+    test('entryForDate ignores the time component', () async {
+      await db.upsertEntry(DateTime(2026, 7, 10, 9, 30), 'morning');
+      final entry = await db.entryForDate(DateTime(2026, 7, 10, 21, 0));
+      expect(entry?.body, 'morning');
+    });
+  });
+
+  testWidgets('list screen renders empty state', (tester) async {
+    // Drift's NativeDatabase does real (non-fake) async I/O, so the stream
+    // query and close() must run on the real event loop via runAsync.
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+
+      await tester.pumpWidget(MyApp(database: db));
+      // Let the drift stream emit its first (empty) event, then rebuild past
+      // the initial CircularProgressIndicator to the empty-state text.
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await tester.pump();
+
+      expect(find.text('Journal'), findsOneWidget);
+      expect(find.textContaining('No entries yet'), findsOneWidget);
+
+      await db.close();
+    });
   });
 }
