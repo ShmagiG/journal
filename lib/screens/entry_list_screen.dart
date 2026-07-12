@@ -45,10 +45,10 @@ class EntryListScreen extends StatelessWidget {
                   : dateLabel;
               return ListTile(
                 title: Text(label),
-                subtitle: entry.body.trim().isEmpty
+                subtitle: entry.preview.trim().isEmpty
                     ? null
                     : Text(
-                        entry.body,
+                        entry.preview,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                       ),
