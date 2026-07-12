@@ -20,6 +20,7 @@ class EntryEditorScreen extends StatefulWidget {
 
 class _EntryEditorScreenState extends State<EntryEditorScreen> {
   final _controller = TextEditingController();
+  final _titleController = TextEditingController();
   Entry? _entry;
   bool _loading = true;
 
@@ -35,22 +36,26 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     setState(() {
       _entry = entry;
       _controller.text = entry?.body ?? '';
+      _titleController.text = entry?.title ?? '';
       _loading = false;
     });
   }
 
   /// Persists the current text. Avoids creating an empty row for a brand-new
-  /// day, and removes an existing entry that has been emptied out.
+  /// day, and removes an existing entry that has been emptied out. An entry is
+  /// kept when it has a title or a body; only when both are empty is it deleted.
   Future<void> _save() async {
     if (_loading) return;
-    final text = _controller.text;
-    if (text.trim().isEmpty) {
+    final body = _controller.text;
+    final title = _titleController.text;
+    final normalizedTitle = title.trim().isEmpty ? null : title.trim();
+    if (body.trim().isEmpty && normalizedTitle == null) {
       if (_entry != null) {
         await widget.database.deleteEntry(_entry!.id);
       }
       return;
     }
-    await widget.database.upsertEntry(widget.date, text);
+    await widget.database.upsertEntry(widget.date, body, title: normalizedTitle);
   }
 
   Future<void> _delete() async {
@@ -63,6 +68,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   @override
   void dispose() {
     _controller.dispose();
+    _titleController.dispose();
     super.dispose();
   }
 
@@ -89,17 +95,34 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
             ? const Center(child: CircularProgressIndicator())
             : Padding(
                 padding: const EdgeInsets.all(16),
-                child: TextField(
-                  controller: _controller,
-                  autofocus: true,
-                  expands: true,
-                  maxLines: null,
-                  minLines: null,
-                  textAlignVertical: TextAlignVertical.top,
-                  decoration: const InputDecoration(
-                    border: InputBorder.none,
-                    hintText: 'Write your note…',
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    TextField(
+                      controller: _titleController,
+                      autofocus: true,
+                      textInputAction: TextInputAction.next,
+                      style: Theme.of(context).textTheme.titleLarge,
+                      decoration: const InputDecoration(
+                        border: InputBorder.none,
+                        hintText: 'Title (optional)',
+                      ),
+                    ),
+                    const Divider(),
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        expands: true,
+                        maxLines: null,
+                        minLines: null,
+                        textAlignVertical: TextAlignVertical.top,
+                        decoration: const InputDecoration(
+                          border: InputBorder.none,
+                          hintText: 'Write your note…',
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ),
       ),

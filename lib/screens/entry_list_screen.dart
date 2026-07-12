@@ -39,8 +39,12 @@ class EntryListScreen extends StatelessWidget {
             itemCount: entries.length,
             itemBuilder: (context, index) {
               final entry = entries[index];
+              final dateLabel = DateFormat.yMMMMEEEEd().format(entry.date);
+              final label = (entry.title?.trim().isNotEmpty ?? false)
+                  ? '$dateLabel · ${entry.title!.trim()}'
+                  : dateLabel;
               return ListTile(
-                title: Text(DateFormat.yMMMMEEEEd().format(entry.date)),
+                title: Text(label),
                 subtitle: entry.body.trim().isEmpty
                     ? null
                     : Text(

@@ -13,6 +13,10 @@ class Entries extends Table {
   /// that each day has exactly one entry.
   DateTimeColumn get date => dateTime().unique()();
 
+  /// An optional user-provided name for the entry, shown next to the date.
+  /// Null when the user hasn't named the entry.
+  TextColumn get title => text().nullable()();
+
   TextColumn get body => text().withDefault(const Constant(''))();
 
   DateTimeColumn get createdAt => dateTime().withDefault(currentDateAndTime)();
@@ -27,7 +31,15 @@ class AppDatabase extends _$AppDatabase {
     : super(executor ?? driftDatabase(name: 'journal'));
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
+
+  @override
+  MigrationStrategy get migration => MigrationStrategy(
+    onCreate: (m) => m.createAll(),
+    onUpgrade: (m, from, to) async {
+      if (from < 2) await m.addColumn(entries, entries.title);
+    },
+  );
 
   /// Strips the time component, giving the local-midnight key for a day.
   static DateTime dateOnly(DateTime d) => DateTime(d.year, d.month, d.day);
@@ -44,18 +56,26 @@ class AppDatabase extends _$AppDatabase {
     return (select(entries)..where((t) => t.date.equals(key))).getSingleOrNull();
   }
 
-  /// Creates or updates the entry for [day] with [body].
-  Future<void> upsertEntry(DateTime day, String body) {
+  /// Creates or updates the entry for [day] with [body] and an optional [title].
+  Future<void> upsertEntry(DateTime day, String body, {String? title}) {
     final key = dateOnly(day);
     return transaction(() async {
       final existing = await entryForDate(key);
       if (existing == null) {
         await into(entries).insert(
-          EntriesCompanion.insert(date: key, body: Value(body)),
+          EntriesCompanion.insert(
+            date: key,
+            body: Value(body),
+            title: Value(title),
+          ),
         );
       } else {
         await (update(entries)..where((t) => t.id.equals(existing.id))).write(
-          EntriesCompanion(body: Value(body), updatedAt: Value(DateTime.now())),
+          EntriesCompanion(
+            body: Value(body),
+            title: Value(title),
+            updatedAt: Value(DateTime.now()),
+          ),
         );
       }
     });

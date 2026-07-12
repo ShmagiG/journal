@@ -31,6 +31,15 @@ class $EntriesTable extends Entries with TableInfo<$EntriesTable, Entry> {
     requiredDuringInsert: true,
     defaultConstraints: GeneratedColumn.constraintIsAlways('UNIQUE'),
   );
+  static const VerificationMeta _titleMeta = const VerificationMeta('title');
+  @override
+  late final GeneratedColumn<String> title = GeneratedColumn<String>(
+    'title',
+    aliasedName,
+    true,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+  );
   static const VerificationMeta _bodyMeta = const VerificationMeta('body');
   @override
   late final GeneratedColumn<String> body = GeneratedColumn<String>(
@@ -66,7 +75,14 @@ class $EntriesTable extends Entries with TableInfo<$EntriesTable, Entry> {
     defaultValue: currentDateAndTime,
   );
   @override
-  List<GeneratedColumn> get $columns => [id, date, body, createdAt, updatedAt];
+  List<GeneratedColumn> get $columns => [
+    id,
+    date,
+    title,
+    body,
+    createdAt,
+    updatedAt,
+  ];
   @override
   String get aliasedName => _alias ?? actualTableName;
   @override
@@ -89,6 +105,12 @@ class $EntriesTable extends Entries with TableInfo<$EntriesTable, Entry> {
       );
     } else if (isInserting) {
       context.missing(_dateMeta);
+    }
+    if (data.containsKey('title')) {
+      context.handle(
+        _titleMeta,
+        title.isAcceptableOrUnknown(data['title']!, _titleMeta),
+      );
     }
     if (data.containsKey('body')) {
       context.handle(
@@ -125,6 +147,10 @@ class $EntriesTable extends Entries with TableInfo<$EntriesTable, Entry> {
         DriftSqlType.dateTime,
         data['${effectivePrefix}date'],
       )!,
+      title: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}title'],
+      ),
       body: attachedDatabase.typeMapping.read(
         DriftSqlType.string,
         data['${effectivePrefix}body'],
@@ -152,12 +178,17 @@ class Entry extends DataClass implements Insertable<Entry> {
   /// The day this entry belongs to, normalized to local midnight. Unique so
   /// that each day has exactly one entry.
   final DateTime date;
+
+  /// An optional user-provided name for the entry, shown next to the date.
+  /// Null when the user hasn't named the entry.
+  final String? title;
   final String body;
   final DateTime createdAt;
   final DateTime updatedAt;
   const Entry({
     required this.id,
     required this.date,
+    this.title,
     required this.body,
     required this.createdAt,
     required this.updatedAt,
@@ -167,6 +198,9 @@ class Entry extends DataClass implements Insertable<Entry> {
     final map = <String, Expression>{};
     map['id'] = Variable<int>(id);
     map['date'] = Variable<DateTime>(date);
+    if (!nullToAbsent || title != null) {
+      map['title'] = Variable<String>(title);
+    }
     map['body'] = Variable<String>(body);
     map['created_at'] = Variable<DateTime>(createdAt);
     map['updated_at'] = Variable<DateTime>(updatedAt);
@@ -177,6 +211,9 @@ class Entry extends DataClass implements Insertable<Entry> {
     return EntriesCompanion(
       id: Value(id),
       date: Value(date),
+      title: title == null && nullToAbsent
+          ? const Value.absent()
+          : Value(title),
       body: Value(body),
       createdAt: Value(createdAt),
       updatedAt: Value(updatedAt),
@@ -191,6 +228,7 @@ class Entry extends DataClass implements Insertable<Entry> {
     return Entry(
       id: serializer.fromJson<int>(json['id']),
       date: serializer.fromJson<DateTime>(json['date']),
+      title: serializer.fromJson<String?>(json['title']),
       body: serializer.fromJson<String>(json['body']),
       createdAt: serializer.fromJson<DateTime>(json['createdAt']),
       updatedAt: serializer.fromJson<DateTime>(json['updatedAt']),
@@ -202,6 +240,7 @@ class Entry extends DataClass implements Insertable<Entry> {
     return <String, dynamic>{
       'id': serializer.toJson<int>(id),
       'date': serializer.toJson<DateTime>(date),
+      'title': serializer.toJson<String?>(title),
       'body': serializer.toJson<String>(body),
       'createdAt': serializer.toJson<DateTime>(createdAt),
       'updatedAt': serializer.toJson<DateTime>(updatedAt),
@@ -211,12 +250,14 @@ class Entry extends DataClass implements Insertable<Entry> {
   Entry copyWith({
     int? id,
     DateTime? date,
+    Value<String?> title = const Value.absent(),
     String? body,
     DateTime? createdAt,
     DateTime? updatedAt,
   }) => Entry(
     id: id ?? this.id,
     date: date ?? this.date,
+    title: title.present ? title.value : this.title,
     body: body ?? this.body,
     createdAt: createdAt ?? this.createdAt,
     updatedAt: updatedAt ?? this.updatedAt,
@@ -225,6 +266,7 @@ class Entry extends DataClass implements Insertable<Entry> {
     return Entry(
       id: data.id.present ? data.id.value : this.id,
       date: data.date.present ? data.date.value : this.date,
+      title: data.title.present ? data.title.value : this.title,
       body: data.body.present ? data.body.value : this.body,
       createdAt: data.createdAt.present ? data.createdAt.value : this.createdAt,
       updatedAt: data.updatedAt.present ? data.updatedAt.value : this.updatedAt,
@@ -236,6 +278,7 @@ class Entry extends DataClass implements Insertable<Entry> {
     return (StringBuffer('Entry(')
           ..write('id: $id, ')
           ..write('date: $date, ')
+          ..write('title: $title, ')
           ..write('body: $body, ')
           ..write('createdAt: $createdAt, ')
           ..write('updatedAt: $updatedAt')
@@ -244,13 +287,14 @@ class Entry extends DataClass implements Insertable<Entry> {
   }
 
   @override
-  int get hashCode => Object.hash(id, date, body, createdAt, updatedAt);
+  int get hashCode => Object.hash(id, date, title, body, createdAt, updatedAt);
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       (other is Entry &&
           other.id == this.id &&
           other.date == this.date &&
+          other.title == this.title &&
           other.body == this.body &&
           other.createdAt == this.createdAt &&
           other.updatedAt == this.updatedAt);
@@ -259,12 +303,14 @@ class Entry extends DataClass implements Insertable<Entry> {
 class EntriesCompanion extends UpdateCompanion<Entry> {
   final Value<int> id;
   final Value<DateTime> date;
+  final Value<String?> title;
   final Value<String> body;
   final Value<DateTime> createdAt;
   final Value<DateTime> updatedAt;
   const EntriesCompanion({
     this.id = const Value.absent(),
     this.date = const Value.absent(),
+    this.title = const Value.absent(),
     this.body = const Value.absent(),
     this.createdAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
@@ -272,6 +318,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
   EntriesCompanion.insert({
     this.id = const Value.absent(),
     required DateTime date,
+    this.title = const Value.absent(),
     this.body = const Value.absent(),
     this.createdAt = const Value.absent(),
     this.updatedAt = const Value.absent(),
@@ -279,6 +326,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
   static Insertable<Entry> custom({
     Expression<int>? id,
     Expression<DateTime>? date,
+    Expression<String>? title,
     Expression<String>? body,
     Expression<DateTime>? createdAt,
     Expression<DateTime>? updatedAt,
@@ -286,6 +334,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
     return RawValuesInsertable({
       if (id != null) 'id': id,
       if (date != null) 'date': date,
+      if (title != null) 'title': title,
       if (body != null) 'body': body,
       if (createdAt != null) 'created_at': createdAt,
       if (updatedAt != null) 'updated_at': updatedAt,
@@ -295,6 +344,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
   EntriesCompanion copyWith({
     Value<int>? id,
     Value<DateTime>? date,
+    Value<String?>? title,
     Value<String>? body,
     Value<DateTime>? createdAt,
     Value<DateTime>? updatedAt,
@@ -302,6 +352,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
     return EntriesCompanion(
       id: id ?? this.id,
       date: date ?? this.date,
+      title: title ?? this.title,
       body: body ?? this.body,
       createdAt: createdAt ?? this.createdAt,
       updatedAt: updatedAt ?? this.updatedAt,
@@ -316,6 +367,9 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
     }
     if (date.present) {
       map['date'] = Variable<DateTime>(date.value);
+    }
+    if (title.present) {
+      map['title'] = Variable<String>(title.value);
     }
     if (body.present) {
       map['body'] = Variable<String>(body.value);
@@ -334,6 +388,7 @@ class EntriesCompanion extends UpdateCompanion<Entry> {
     return (StringBuffer('EntriesCompanion(')
           ..write('id: $id, ')
           ..write('date: $date, ')
+          ..write('title: $title, ')
           ..write('body: $body, ')
           ..write('createdAt: $createdAt, ')
           ..write('updatedAt: $updatedAt')
@@ -357,6 +412,7 @@ typedef $$EntriesTableCreateCompanionBuilder =
     EntriesCompanion Function({
       Value<int> id,
       required DateTime date,
+      Value<String?> title,
       Value<String> body,
       Value<DateTime> createdAt,
       Value<DateTime> updatedAt,
@@ -365,6 +421,7 @@ typedef $$EntriesTableUpdateCompanionBuilder =
     EntriesCompanion Function({
       Value<int> id,
       Value<DateTime> date,
+      Value<String?> title,
       Value<String> body,
       Value<DateTime> createdAt,
       Value<DateTime> updatedAt,
@@ -386,6 +443,11 @@ class $$EntriesTableFilterComposer
 
   ColumnFilters<DateTime> get date => $composableBuilder(
     column: $table.date,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get title => $composableBuilder(
+    column: $table.title,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -424,6 +486,11 @@ class $$EntriesTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get title => $composableBuilder(
+    column: $table.title,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get body => $composableBuilder(
     column: $table.body,
     builder: (column) => ColumnOrderings(column),
@@ -454,6 +521,9 @@ class $$EntriesTableAnnotationComposer
 
   GeneratedColumn<DateTime> get date =>
       $composableBuilder(column: $table.date, builder: (column) => column);
+
+  GeneratedColumn<String> get title =>
+      $composableBuilder(column: $table.title, builder: (column) => column);
 
   GeneratedColumn<String> get body =>
       $composableBuilder(column: $table.body, builder: (column) => column);
@@ -495,12 +565,14 @@ class $$EntriesTableTableManager
               ({
                 Value<int> id = const Value.absent(),
                 Value<DateTime> date = const Value.absent(),
+                Value<String?> title = const Value.absent(),
                 Value<String> body = const Value.absent(),
                 Value<DateTime> createdAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
               }) => EntriesCompanion(
                 id: id,
                 date: date,
+                title: title,
                 body: body,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
@@ -509,12 +581,14 @@ class $$EntriesTableTableManager
               ({
                 Value<int> id = const Value.absent(),
                 required DateTime date,
+                Value<String?> title = const Value.absent(),
                 Value<String> body = const Value.absent(),
                 Value<DateTime> createdAt = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
               }) => EntriesCompanion.insert(
                 id: id,
                 date: date,
+                title: title,
                 body: body,
                 createdAt: createdAt,
                 updatedAt: updatedAt,
