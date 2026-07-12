@@ -4,28 +4,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-This is a local-first journal app. `lib/main.dart` is currently still the default
-`flutter create` counter-app boilerplate — no journal features (entries, storage, rich
-text, drawing) have been implemented yet. `pubspec.yaml` already declares the intended
-dependencies, so treat this document as the target architecture to build toward, not a
-description of existing code.
+This is a local-first journal app built around a **free-form canvas** (think Excalidraw
+/ iPad Notes), not a document editor. Each entry is a spatial surface you pan and zoom,
+onto which you place text, collapsible subnotes, and freehand pen strokes *anywhere*,
+overlapping and layered as you like. The core canvas, storage, and the three element
+kinds (text / subnote / stroke) are implemented in `lib/`.
+
+Deliberate near-term simplifications, so plan around them:
+- **Text is plain-text-first.** Text/subnote elements have a single font size + color for
+  the whole box; inline rich formatting (bold/italic/lists) is future work.
+- The canvas is a **large fixed-size surface** (see `_canvasSize` in
+  `entry_editor_screen.dart`), not a truly virtualized infinite canvas.
 
 ## Architecture
 
-- **Entries are mixed-content documents.** A single journal entry is one page that can
-  contain both rich-text blocks and freehand-sketch blocks, interleaved in sequence (e.g.
-  paragraph → sketch → paragraph). Model an entry as an ordered list of typed blocks
-  rather than a single flutter_quill document or a single scribble canvas — the two
-  content types need to coexist and be reorderable/editable independently within one page.
-- **Rich text** is authored and rendered with `flutter_quill`. Text blocks store Quill
-  Delta JSON.
-- **Sketches** are authored and rendered with `scribble`. Sketch blocks store Scribble's
-  serializable stroke/sketch data (not rasterized images), so drawings stay editable.
-- **Storage is local-first via `drift`** (SQLite, using `drift_flutter` for
-  platform-specific database setup). Entries and their blocks should be modeled as Drift
-  tables (e.g. an `entries` table plus a `blocks` table with a discriminator column for
-  block type and a position/order column), not as a single blob column, so blocks can be
-  queried/reordered without deserializing an entire entry.
+- **No third-party rich-text or drawing libraries.** `flutter_quill` and `scribble` have
+  been removed by design — the text layer is built on Flutter's own `TextField`/
+  `EditableText` primitive and drawing is a self-implemented stroke engine. Do not
+  reintroduce an editor/drawing package; extend the hand-rolled implementation instead.
+- **Entries are a canvas of positioned, layered elements.** A single entry is a spatial
+  surface holding an unordered set of absolutely-positioned elements (`x`, `y`, optional
+  `width`/`height`, layer `z`), each of a discriminated kind. Elements can overlap freely.
+- **Element kinds** live in `lib/models/elements.dart` as a sealed `ElementData`
+  hierarchy (`TextElementData`, `SubnoteElementData`, `StrokeElementData`, plus
+  `UnknownElementData` which preserves unrecognized JSON for forward-compat). Adding a
+  kind = new subclass + `type` string + a `case` in `ElementData.decode` — **no schema
+  change**. `PlacedElement` pairs an `ElementData` with its spatial placement for
+  transport between the editor and the database.
+- **Drawing** is a custom stroke engine: strokes are captured as raw point lists
+  (`StrokeElementData.points`, stored relative to the element origin) and rendered with a
+  `CustomPainter`. The raw points are intentionally preserved (not rasterized) so a future
+  AI pass can recognize shapes/objects from them.
+- **The editor** (`lib/screens/entry_editor_screen.dart`) is an `InteractiveViewer`
+  (pan/zoom) over a `Stack` of positioned elements, with a tool mode (`select` / `text` /
+  `draw`). The background pointer surface lives *inside* the zoomed child so its local
+  coordinates are already canvas coordinates. Screen drag deltas for move/resize are
+  divided by the current scale.
+- **Storage is local-first via `drift`** (SQLite, `drift_flutter` for platform setup).
+  Two live tables: `Entries` (one per calendar day, keyed by `date`) and `Elements`
+  (placement in columns `x`/`y`/`width`/`height`/`z` + a JSON `data` payload keyed by
+  `type`). The legacy `Blocks` table remains defined **only** so the v3→v4 migration can
+  fold old ordered blocks into positioned elements; no live code writes to it, and
+  `lib/models/blocks.dart` is kept solely for that migration path.
 - Editing a `@DriftDatabase`/table/DAO definition requires regenerating code:
   ```bash
   dart run build_runner build --delete-conflicting-outputs

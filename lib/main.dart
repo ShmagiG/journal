@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_quill/flutter_quill.dart';
 
 import 'data/database.dart';
 import 'screens/entry_list_screen.dart';
@@ -20,15 +18,10 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Journal',
       theme: ThemeData(
-        colorScheme: .fromSeed(seedColor: const Color.fromARGB(255, 119, 34, 34)),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color.fromARGB(255, 119, 34, 34),
+        ),
       ),
-      localizationsDelegates: const [
-        GlobalMaterialLocalizations.delegate,
-        GlobalWidgetsLocalizations.delegate,
-        GlobalCupertinoLocalizations.delegate,
-        FlutterQuillLocalizations.delegate,
-      ],
-      supportedLocales: FlutterQuillLocalizations.supportedLocales,
       home: EntryListScreen(database: database),
     );
   }

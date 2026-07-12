@@ -1,70 +1,82 @@
+import 'dart:ui' show PointMode;
+
 import 'package:flutter/material.dart';
-import 'package:flutter_quill/flutter_quill.dart';
 import 'package:intl/intl.dart';
 
 import '../data/database.dart';
-import '../models/blocks.dart';
+import '../models/elements.dart';
 
-/// Holds the live editing state for one block: its [data], a Quill [quill]
-/// controller (null for block kinds this version can't edit, e.g.
-/// [UnknownBlockData]), a [focus] node used to drive the shared toolbar, and a
-/// [scroll] controller for subnotes that scroll internally. [key] is a stable
-/// identity for [ReorderableListView] item keys across reorders.
-class _BlockController {
-  _BlockController(this.key, this.data)
-    : quill = _quillFor(data),
-      focus = FocusNode(),
-      scroll = ScrollController();
+/// The active canvas tool. Selecting one changes what a pointer does on the
+/// canvas: move/select existing elements, drop new text, or draw freehand.
+enum _Tool { select, text, draw }
+
+/// Logical size of the (large, fixed) canvas. Big enough to feel edgeless when
+/// panned/zoomed; true infinite virtualization is future work.
+const double _canvasSize = 5000;
+
+/// Colors offered for text and pen. First entry doubles as the default.
+const List<Color> _palette = [
+  Colors.black,
+  Color(0xFFD32F2F), // red
+  Color(0xFF1976D2), // blue
+  Color(0xFF388E3C), // green
+  Color(0xFFF57C00), // orange
+  Color(0xFF7B1FA2), // purple
+];
+
+/// Live editing state for one canvas element: its spatial placement, its
+/// [data], and (for text/subnote kinds) a [textController]/[focus] pair. [key]
+/// is a stable identity for widget keys across rebuilds.
+class _CanvasElement {
+  _CanvasElement({
+    required this.key,
+    required this.data,
+    this.x = 0,
+    this.y = 0,
+    this.width,
+    this.height,
+    this.z = 0,
+  }) : textController = _makeController(data),
+       focus = data is StrokeElementData ? null : FocusNode();
 
   final int key;
-  final BlockData data;
-  final QuillController? quill;
-  final FocusNode focus;
-  final ScrollController scroll;
+  double x;
+  double y;
+  double? width;
+  double? height;
+  int z;
+  final ElementData data;
+  final TextEditingController? textController;
+  final FocusNode? focus;
 
-  static QuillController? _quillFor(BlockData data) {
-    final List<dynamic> delta;
-    if (data is TextBlockData) {
-      delta = data.delta;
-    } else if (data is SubnoteBlockData) {
-      delta = data.delta;
-    } else {
-      return null; // Unknown block: shown as a read-only placeholder.
-    }
-    Document doc;
-    try {
-      doc = delta.isEmpty ? Document() : Document.fromJson(delta);
-    } catch (_) {
-      doc = Document();
-    }
-    return QuillController(
-      document: doc,
-      selection: const TextSelection.collapsed(offset: 0),
-    );
+  static TextEditingController? _makeController(ElementData d) {
+    if (d is TextElementData) return TextEditingController(text: d.text);
+    if (d is SubnoteElementData) return TextEditingController(text: d.text);
+    return null;
   }
 
-  /// Writes the live editor content back into [data] so it can be persisted.
+  /// Writes the live text back into [data] so it can be persisted.
   void syncToData() {
-    final q = quill;
-    if (q == null) return;
-    final delta = q.document.toDelta().toJson();
     final d = data;
-    if (d is TextBlockData) {
-      d.delta = delta;
-    } else if (d is SubnoteBlockData) {
-      d.delta = delta;
+    if (d is TextElementData) {
+      d.text = textController!.text;
+    } else if (d is SubnoteElementData) {
+      d.text = textController!.text;
     }
   }
+
+  PlacedElement toPlaced() =>
+      PlacedElement(x: x, y: y, width: width, height: height, z: z, data: data);
 
   void dispose() {
-    quill?.dispose();
-    focus.dispose();
-    scroll.dispose();
+    textController?.dispose();
+    focus?.dispose();
   }
 }
 
-/// Write or edit the journal entry for a given [date] as a page-like canvas of
-/// ordered, reorderable blocks (flowing rich text plus collapsible subnotes).
+/// Write or edit the journal entry for a given [date] as a free-form canvas of
+/// absolutely-positioned, layered elements — plain-text boxes, collapsible
+/// subnotes, and freehand pen strokes.
 class EntryEditorScreen extends StatefulWidget {
   const EntryEditorScreen({
     super.key,
@@ -81,14 +93,23 @@ class EntryEditorScreen extends StatefulWidget {
 
 class _EntryEditorScreenState extends State<EntryEditorScreen> {
   final _titleController = TextEditingController();
-  final List<_BlockController> _blocks = [];
+  final _transform = TransformationController();
+  final List<_CanvasElement> _elements = [];
   Entry? _entry;
   bool _loading = true;
   int _nextKey = 0;
 
-  /// The controller of the most recently focused block; the shared formatting
-  /// toolbar acts on it.
-  QuillController? _activeController;
+  _Tool _tool = _Tool.select;
+  _CanvasElement? _selected;
+
+  // Pen settings for the draw tool.
+  Color _penColor = _palette[0];
+  double _penWidth = StrokeElementData.defaultWidth;
+
+  // The stroke currently being drawn, in canvas coordinates (null when idle).
+  List<Offset>? _drawing;
+
+  Size _viewport = Size.zero;
 
   @override
   void initState() {
@@ -98,87 +119,182 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   Future<void> _load() async {
     final entry = await widget.database.entryForDate(widget.date);
-    var datas = <BlockData>[];
+    final loaded = <_CanvasElement>[];
     if (entry != null) {
-      final rows = await widget.database.blocksForEntry(entry.id);
-      datas = rows.map((r) => BlockData.decode(r.type, r.data)).toList();
+      final rows = await widget.database.elementsForEntry(entry.id);
+      for (final r in rows) {
+        loaded.add(
+          _CanvasElement(
+            key: _nextKey++,
+            data: ElementData.decode(r.type, r.data),
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            z: r.z,
+          ),
+        );
+      }
     }
-    if (datas.isEmpty) datas = [TextBlockData.empty()];
-
     if (!mounted) return;
     setState(() {
       _entry = entry;
       _titleController.text = entry?.title ?? '';
-      for (final d in datas) {
-        _blocks.add(_makeBlock(d));
-      }
+      _elements.addAll(loaded);
       _loading = false;
     });
   }
 
-  _BlockController _makeBlock(BlockData data) {
-    final bc = _BlockController(_nextKey++, data);
-    bc.focus.addListener(() => _onFocusChange(bc));
-    return bc;
+  int get _topZ =>
+      _elements.isEmpty ? 0 : _elements.map((e) => e.z).reduce((a, b) => a > b ? a : b);
+
+  /// Canvas coordinate at the centre of the current viewport, for placing new
+  /// elements somewhere visible.
+  Offset _visibleCenter() {
+    final screenCenter = Offset(_viewport.width / 2, _viewport.height / 2);
+    return _transform.toScene(screenCenter);
   }
 
-  void _onFocusChange(_BlockController bc) {
-    // Only follow focus gains so the toolbar keeps targeting the last-edited
-    // block while the user reaches for a toolbar button.
-    if (bc.focus.hasFocus && _activeController != bc.quill) {
-      setState(() => _activeController = bc.quill);
-    }
+  void _select(_CanvasElement? el) {
+    setState(() => _selected = el);
   }
 
-  int? _focusedIndex() {
-    for (var i = 0; i < _blocks.length; i++) {
-      if (_blocks[i].focus.hasFocus) return i;
-    }
-    return null;
+  /// Public rebuild hook for child element widgets (they can't call the
+  /// protected [setState] directly).
+  void rebuild([VoidCallback? mutate]) {
+    setState(() => mutate?.call());
   }
 
-  void _addBlock(BlockData data) {
-    final bc = _makeBlock(data);
-    final idx = _focusedIndex();
+  _CanvasElement _add(
+    ElementData data, {
+    required double x,
+    required double y,
+    double? width,
+    double? height,
+  }) {
+    final el = _CanvasElement(
+      key: _nextKey++,
+      data: data,
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      z: _topZ + 1,
+    );
     setState(() {
-      if (idx == null) {
-        _blocks.add(bc);
-      } else {
-        _blocks.insert(idx + 1, bc);
-      }
+      _elements.add(el);
+      _selected = el;
     });
+    return el;
+  }
+
+  void _addTextAt(Offset canvasPoint) {
+    final el = _add(
+      TextElementData.empty(),
+      x: canvasPoint.dx,
+      y: canvasPoint.dy,
+      width: 220,
+    );
+    setState(() => _tool = _Tool.select);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) bc.focus.requestFocus();
+      if (mounted) el.focus?.requestFocus();
     });
   }
 
-  void _deleteBlock(_BlockController bc) {
-    setState(() {
-      _blocks.remove(bc);
-      if (_activeController == bc.quill) _activeController = null;
-      // Always keep at least one block to write in.
-      if (_blocks.isEmpty) _blocks.add(_makeBlock(TextBlockData.empty()));
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) => bc.dispose());
+  void _addSubnote() {
+    final c = _visibleCenter();
+    _add(
+      SubnoteElementData.empty(),
+      x: c.dx - SubnoteElementData.defaultWidth / 2,
+      y: c.dy - SubnoteElementData.defaultHeight / 2,
+      width: SubnoteElementData.defaultWidth,
+      height: SubnoteElementData.defaultHeight,
+    );
+    setState(() => _tool = _Tool.select);
   }
 
-  void _onReorder(int oldIndex, int newIndex) {
-    // onReorderItem already adjusts newIndex for the removed item.
+  void _deleteSelected() {
+    final el = _selected;
+    if (el == null) return;
     setState(() {
-      final item = _blocks.removeAt(oldIndex);
-      _blocks.insert(newIndex, item);
+      _elements.remove(el);
+      _selected = null;
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
   }
+
+  void _bringToFront() {
+    final el = _selected;
+    if (el == null) return;
+    setState(() => el.z = _topZ + 1);
+  }
+
+  // --- Drawing (draw tool) -------------------------------------------------
+
+  void _onPointerDown(PointerDownEvent e) {
+    if (_tool != _Tool.draw) return;
+    setState(() => _drawing = [e.localPosition]);
+  }
+
+  void _onPointerMove(PointerMoveEvent e) {
+    if (_tool != _Tool.draw || _drawing == null) return;
+    setState(() => _drawing!.add(e.localPosition));
+  }
+
+  void _onPointerUp(PointerUpEvent e) {
+    if (_tool != _Tool.draw || _drawing == null) return;
+    final pts = _drawing!;
+    _drawing = null;
+    if (pts.isEmpty) {
+      setState(() {});
+      return;
+    }
+    final pad = _penWidth / 2 + 1;
+    var minX = pts.first.dx, minY = pts.first.dy;
+    var maxX = pts.first.dx, maxY = pts.first.dy;
+    for (final p in pts) {
+      minX = p.dx < minX ? p.dx : minX;
+      minY = p.dy < minY ? p.dy : minY;
+      maxX = p.dx > maxX ? p.dx : maxX;
+      maxY = p.dy > maxY ? p.dy : maxY;
+    }
+    final origin = Offset(minX - pad, minY - pad);
+    final rel = [for (final p in pts) p - origin];
+    _add(
+      StrokeElementData(points: rel, color: _penColor.toARGB32(), width: _penWidth),
+      x: origin.dx,
+      y: origin.dy,
+      width: maxX - minX + pad * 2,
+      height: maxY - minY + pad * 2,
+    );
+    // A stroke shouldn't leave the element "selected"; keep drawing fluidly.
+    setState(() => _selected = null);
+  }
+
+  // --- Canvas taps ---------------------------------------------------------
+
+  void _onCanvasTap(Offset canvasPoint) {
+    switch (_tool) {
+      case _Tool.text:
+        _addTextAt(canvasPoint);
+      case _Tool.select:
+        _select(null);
+      case _Tool.draw:
+        break;
+    }
+  }
+
+  // --- Save ----------------------------------------------------------------
 
   Future<void> _save() async {
     if (_loading) return;
-    for (final bc in _blocks) {
-      bc.syncToData();
+    for (final el in _elements) {
+      el.syncToData();
     }
     await widget.database.saveEntry(
       widget.date,
       title: _titleController.text,
-      blocks: _blocks.map((b) => b.data).toList(),
+      elements: _elements.map((e) => e.toPlaced()).toList(),
     );
   }
 
@@ -192,8 +308,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   @override
   void dispose() {
     _titleController.dispose();
-    for (final bc in _blocks) {
-      bc.dispose();
+    _transform.dispose();
+    for (final el in _elements) {
+      el.dispose();
     }
     super.dispose();
   }
@@ -223,10 +340,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
                     child: TextField(
                       controller: _titleController,
-                      textInputAction: TextInputAction.next,
                       style: Theme.of(context).textTheme.titleLarge,
                       decoration: const InputDecoration(
                         border: InputBorder.none,
@@ -234,289 +350,647 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                       ),
                     ),
                   ),
-                  if (_activeController != null)
-                    QuillSimpleToolbar(
-                      controller: _activeController!,
-                      config: const QuillSimpleToolbarConfig(
-                        multiRowsDisplay: false,
-                        showClearFormat: false,
-                        showSearchButton: false,
-                      ),
-                    ),
+                  _toolbar(context),
                   const Divider(height: 1),
-                  Expanded(
-                    child: ReorderableListView.builder(
-                      padding: const EdgeInsets.fromLTRB(8, 8, 8, 96),
-                      buildDefaultDragHandles: false,
-                      itemCount: _blocks.length,
-                      onReorderItem: _onReorder,
-                      itemBuilder: (context, index) {
-                        final bc = _blocks[index];
-                        return _BlockCard(
-                          key: ValueKey(bc.key),
-                          index: index,
-                          block: bc,
-                          onDelete: () => _deleteBlock(bc),
-                          onChanged: () => setState(() {}),
-                        );
-                      },
-                    ),
-                  ),
+                  Expanded(child: _canvas(context)),
                 ],
               ),
-        floatingActionButton: _loading
-            ? null
-            : FloatingActionButton(
-                tooltip: 'Add block',
-                onPressed: _showAddMenu,
-                child: const Icon(Icons.add),
-              ),
       ),
     );
   }
 
-  void _showAddMenu() {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.notes),
-              title: const Text('Text'),
-              subtitle: const Text('A block of flowing rich text'),
-              onTap: () {
-                Navigator.of(context).pop();
-                _addBlock(TextBlockData.empty());
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.sticky_note_2_outlined),
-              title: const Text('Subnote'),
-              subtitle: const Text('A collapsible, resizable side note'),
-              onTap: () {
-                Navigator.of(context).pop();
-                _addBlock(SubnoteBlockData.empty());
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
+  // --- Toolbar -------------------------------------------------------------
 
-/// One block row: a left drag handle, the block's editor, and a delete button.
-class _BlockCard extends StatelessWidget {
-  const _BlockCard({
-    super.key,
-    required this.index,
-    required this.block,
-    required this.onDelete,
-    required this.onChanged,
-  });
-
-  final int index;
-  final _BlockController block;
-  final VoidCallback onDelete;
-
-  /// Called when the block mutates its own layout state (collapse/resize) so the
-  /// parent can rebuild.
-  final VoidCallback onChanged;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          ReorderableDragStartListener(
-            index: index,
-            child: Padding(
-              padding: const EdgeInsets.only(top: 8, right: 4),
-              child: Icon(
-                Icons.drag_indicator,
-                size: 20,
-                color: Theme.of(context).disabledColor,
+  Widget _toolbar(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            children: [
+              _toolButton(Icons.pan_tool_alt_outlined, 'Select / move', _Tool.select),
+              _toolButton(Icons.text_fields, 'Add text (tap canvas)', _Tool.text),
+              _toolButton(Icons.edit, 'Draw', _Tool.draw),
+              const SizedBox(width: 8),
+              IconButton(
+                icon: const Icon(Icons.sticky_note_2_outlined),
+                tooltip: 'Add subnote',
+                onPressed: _addSubnote,
               ),
-            ),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.center_focus_strong),
+                tooltip: 'Reset view',
+                onPressed: () => _transform.value = Matrix4.identity(),
+              ),
+            ],
           ),
-          Expanded(child: _buildContent(context)),
-          IconButton(
-            icon: const Icon(Icons.close, size: 18),
-            tooltip: 'Delete block',
-            visualDensity: VisualDensity.compact,
-            color: Theme.of(context).disabledColor,
-            onPressed: onDelete,
+        ),
+        _contextRow(context),
+      ],
+    );
+  }
+
+  Widget _toolButton(IconData icon, String tip, _Tool tool) {
+    final active = _tool == tool;
+    return IconButton(
+      icon: Icon(icon),
+      tooltip: tip,
+      isSelected: active,
+      color: active ? Theme.of(context).colorScheme.primary : null,
+      onPressed: () => setState(() => _tool = tool),
+    );
+  }
+
+  /// Second toolbar row: pen options when drawing, or format/actions when an
+  /// element is selected. Empty otherwise.
+  Widget _contextRow(BuildContext context) {
+    if (_tool == _Tool.draw) {
+      return _penOptions(context);
+    }
+    final el = _selected;
+    if (el != null && el.data is! StrokeElementData) {
+      return _formatOptions(context, el);
+    }
+    if (el != null && el.data is StrokeElementData) {
+      return _strokeOptions(context);
+    }
+    return const SizedBox(height: 4);
+  }
+
+  Widget _penOptions(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          const SizedBox(width: 8),
+          for (final c in _palette)
+            _swatch(c, _penColor == c, () => setState(() => _penColor = c)),
+          const SizedBox(width: 12),
+          const Icon(Icons.line_weight, size: 18),
+          Expanded(
+            child: Slider(
+              min: 1,
+              max: 16,
+              value: _penWidth,
+              onChanged: (v) => setState(() => _penWidth = v),
+            ),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildContent(BuildContext context) {
-    final data = block.data;
-    if (data is TextBlockData) {
-      return _textEditor(placeholder: 'Write…');
-    } else if (data is SubnoteBlockData) {
-      return _SubnoteBox(block: block, data: data, onChanged: onChanged);
+  Widget _strokeOptions(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          const SizedBox(width: 8),
+          IconButton(
+            icon: const Icon(Icons.flip_to_front),
+            tooltip: 'Bring to front',
+            onPressed: _bringToFront,
+          ),
+          const Spacer(),
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete',
+            onPressed: _deleteSelected,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _formatOptions(BuildContext context, _CanvasElement el) {
+    double fontSize;
+    int? colorValue;
+    final d = el.data;
+    if (d is TextElementData) {
+      fontSize = d.fontSize;
+      colorValue = d.color;
+    } else if (d is SubnoteElementData) {
+      fontSize = d.fontSize;
+      colorValue = d.color;
     } else {
-      // Unknown block kind: preserve it but show a non-editable placeholder.
-      return Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          border: Border.all(color: Theme.of(context).dividerColor),
-          borderRadius: BorderRadius.circular(6),
+      return const SizedBox(height: 4);
+    }
+
+    void setFont(double v) {
+      setState(() {
+        if (d is TextElementData) {
+          d.fontSize = v;
+        } else if (d is SubnoteElementData) {
+          d.fontSize = v;
+        }
+      });
+    }
+
+    void setColor(int? v) {
+      setState(() {
+        if (d is TextElementData) {
+          d.color = v;
+        } else if (d is SubnoteElementData) {
+          d.color = v;
+        }
+      });
+    }
+
+    return SizedBox(
+      height: 44,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        children: [
+          const SizedBox(width: 8),
+          IconButton(
+            icon: const Icon(Icons.remove),
+            tooltip: 'Smaller',
+            onPressed: () => setFont((fontSize - 2).clamp(8, 96)),
+          ),
+          Center(child: Text('${fontSize.round()}')),
+          IconButton(
+            icon: const Icon(Icons.add),
+            tooltip: 'Larger',
+            onPressed: () => setFont((fontSize + 2).clamp(8, 96)),
+          ),
+          const VerticalDivider(width: 8),
+          for (final c in _palette)
+            _swatch(c, colorValue == c.toARGB32(), () => setColor(c.toARGB32())),
+          const VerticalDivider(width: 8),
+          IconButton(
+            icon: const Icon(Icons.flip_to_front),
+            tooltip: 'Bring to front',
+            onPressed: _bringToFront,
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete',
+            onPressed: _deleteSelected,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _swatch(Color color, bool selected, VoidCallback onTap) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 6),
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: Container(
+          width: 26,
+          height: 26,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            border: Border.all(
+              color: selected
+                  ? Theme.of(context).colorScheme.primary
+                  : Theme.of(context).dividerColor,
+              width: selected ? 3 : 1,
+            ),
+          ),
         ),
-        child: Text(data.preview),
+      ),
+    );
+  }
+
+  // --- Canvas --------------------------------------------------------------
+
+  Widget _canvas(BuildContext context) {
+    // Pan/zoom via InteractiveViewer, except in draw mode where a single-finger
+    // drag must paint instead of pan.
+    final interactive = _tool != _Tool.draw;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _viewport = Size(constraints.maxWidth, constraints.maxHeight);
+        return ClipRect(
+          child: InteractiveViewer(
+            transformationController: _transform,
+            constrained: false,
+            minScale: 0.3,
+            maxScale: 5,
+            panEnabled: interactive,
+            scaleEnabled: interactive,
+            child: SizedBox(
+              width: _canvasSize,
+              height: _canvasSize,
+              child: Listener(
+                onPointerDown: _onPointerDown,
+                onPointerMove: _onPointerMove,
+                onPointerUp: _onPointerUp,
+                child: Stack(
+                  children: [
+                    // Background: catches taps for placing text / deselecting.
+                    Positioned.fill(
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTapUp: (d) => _onCanvasTap(d.localPosition),
+                        child: const _CanvasBackground(),
+                      ),
+                    ),
+                    for (final el in _sortedByZ()) _buildElement(context, el),
+                    if (_drawing != null && _drawing!.isNotEmpty)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: CustomPaint(
+                            painter: _StrokePainter(
+                              _drawing!,
+                              _penColor,
+                              _penWidth,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  List<_CanvasElement> _sortedByZ() {
+    final list = [..._elements]..sort((a, b) => a.z.compareTo(b.z));
+    return list;
+  }
+
+  Widget _buildElement(BuildContext context, _CanvasElement el) {
+    final data = el.data;
+    if (data is StrokeElementData) {
+      return _positioned(
+        el,
+        IgnorePointer(
+          ignoring: _tool == _Tool.draw,
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _select(el),
+            onPanUpdate: _tool == _Tool.select ? (d) => _drag(el, d) : null,
+            child: CustomPaint(
+              size: Size(el.width ?? 0, el.height ?? 0),
+              painter: _StrokePainter(
+                data.points,
+                Color(data.color),
+                data.width,
+                selected: _selected == el,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    if (data is SubnoteElementData) {
+      return _positioned(el, _SubnoteCard(state: this, el: el, data: data));
+    }
+    if (data is TextElementData) {
+      return _positioned(el, _TextBox(state: this, el: el, data: data));
+    }
+    return _positioned(
+      el,
+      Container(
+        padding: const EdgeInsets.all(8),
+        color: Theme.of(context).colorScheme.errorContainer,
+        child: const Text('[unsupported]'),
+      ),
+    );
+  }
+
+  Widget _positioned(_CanvasElement el, Widget child) {
+    // Text boxes always auto-size vertically (never impose a fixed height, which
+    // could clip growing text); a collapsed subnote shrinks to just its header.
+    final data = el.data;
+    double? height = el.height;
+    if (data is TextElementData) {
+      height = null;
+    } else if (data is SubnoteElementData && data.collapsed) {
+      height = null;
+    }
+    return Positioned(
+      key: ValueKey(el.key),
+      left: el.x,
+      top: el.y,
+      width: el.width,
+      height: height,
+      child: child,
+    );
+  }
+
+  /// Current InteractiveViewer scale, so screen drag deltas map to canvas px.
+  double get _scale => _transform.value.getMaxScaleOnAxis();
+
+  void _drag(_CanvasElement el, DragUpdateDetails d) {
+    setState(() {
+      el.x += d.delta.dx / _scale;
+      el.y += d.delta.dy / _scale;
+    });
+  }
+
+  void _resize(_CanvasElement el, DragUpdateDetails d) {
+    setState(() {
+      el.width = ((el.width ?? 120) + d.delta.dx / _scale).clamp(60.0, 2000.0);
+      // Text boxes grow only horizontally; their height follows their content.
+      if (el.data is! TextElementData) {
+        el.height = ((el.height ?? 80) + d.delta.dy / _scale).clamp(40.0, 2000.0);
+      }
+    });
+  }
+}
+
+/// A faint dotted background so the (otherwise blank) canvas reads as a surface.
+class _CanvasBackground extends StatelessWidget {
+  const _CanvasBackground();
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _GridPainter(Theme.of(context).dividerColor.withValues(alpha: 0.4)),
+    );
+  }
+}
+
+class _GridPainter extends CustomPainter {
+  _GridPainter(this.color);
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = color;
+    const step = 40.0;
+    for (double x = 0; x < size.width; x += step) {
+      for (double y = 0; y < size.height; y += step) {
+        canvas.drawCircle(Offset(x, y), 0.8, paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _GridPainter old) => old.color != color;
+}
+
+/// Paints a freehand stroke from a list of points (in the painter's local
+/// coordinate space). Adds a subtle highlight box when [selected].
+class _StrokePainter extends CustomPainter {
+  _StrokePainter(this.points, this.color, this.width, {this.selected = false});
+
+  final List<Offset> points;
+  final Color color;
+  final double width;
+  final bool selected;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty) return;
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = width
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    if (points.length == 1) {
+      canvas.drawPoints(PointMode.points, points, paint..strokeCap = StrokeCap.round);
+    } else {
+      final path = Path()..moveTo(points.first.dx, points.first.dy);
+      for (var i = 1; i < points.length; i++) {
+        path.lineTo(points[i].dx, points[i].dy);
+      }
+      canvas.drawPath(path, paint);
+    }
+    if (selected && size.width > 0) {
+      canvas.drawRect(
+        Offset.zero & size,
+        Paint()
+          ..color = color.withValues(alpha: 0.4)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1,
       );
     }
   }
 
-  Widget _textEditor({required String placeholder}) {
-    return QuillEditor.basic(
-      controller: block.quill!,
-      focusNode: block.focus,
-      scrollController: block.scroll,
-      config: QuillEditorConfig(
-        scrollable: false,
-        expands: false,
-        autoFocus: false,
-        placeholder: placeholder,
-        padding: const EdgeInsets.symmetric(vertical: 6),
+  @override
+  bool shouldRepaint(covariant _StrokePainter old) =>
+      old.points != points ||
+      old.color != color ||
+      old.width != width ||
+      old.selected != selected;
+}
+
+/// A movable, resizable plain-text box. Tapping selects it; when selected a
+/// frame with a move bar and a resize handle appears and the text is editable.
+class _TextBox extends StatelessWidget {
+  const _TextBox({required this.state, required this.el, required this.data});
+
+  final _EntryEditorScreenState state;
+  final _CanvasElement el;
+  final TextElementData data;
+
+  @override
+  Widget build(BuildContext context) {
+    final selected = state._selected == el;
+    final style = TextStyle(
+      fontSize: data.fontSize,
+      color: data.color != null ? Color(data.color!) : null,
+    );
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => state._select(el),
+      child: _Frame(
+        selected: selected,
+        onMove: (d) => state._drag(el, d),
+        onResize: (d) => state._resize(el, d),
+        child: TextField(
+          controller: el.textController,
+          focusNode: el.focus,
+          readOnly: !selected,
+          maxLines: null,
+          style: style,
+          cursorColor: Theme.of(context).colorScheme.primary,
+          decoration: InputDecoration(
+            isDense: true,
+            border: InputBorder.none,
+            hintText: selected ? 'Write…' : null,
+            contentPadding: const EdgeInsets.all(6),
+          ),
+          onChanged: (_) => state.rebuild(),
+        ),
       ),
     );
   }
 }
 
-/// The collapsible, user-resizable subnote box. Collapsed it shows a one-line
-/// preview; expanded it shows the full rich text in a fixed-height box that
-/// scrolls internally, with a bottom handle to drag the height.
-class _SubnoteBox extends StatelessWidget {
-  const _SubnoteBox({
-    required this.block,
-    required this.data,
-    required this.onChanged,
-  });
+/// A floating, collapsible subnote card. The header (tap to collapse/expand) is
+/// always shown; the body is an editable text area when expanded.
+class _SubnoteCard extends StatelessWidget {
+  const _SubnoteCard({required this.state, required this.el, required this.data});
 
-  final _BlockController block;
-  final SubnoteBlockData data;
-  final VoidCallback onChanged;
+  final _EntryEditorScreenState state;
+  final _CanvasElement el;
+  final SubnoteElementData data;
+
+  String get _headerText {
+    final t = (el.textController?.text ?? data.text).trim();
+    if (t.isEmpty) return 'Subnote';
+    final first = t.split('\n').first;
+    return first.length > 40 ? '${first.substring(0, 40)}…' : first;
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
-        border: Border(
-          left: BorderSide(color: scheme.primary, width: 3),
-        ),
-        borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          InkWell(
-            onTap: () {
-              data.collapsed = !data.collapsed;
-              onChanged();
-            },
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-              child: Row(
-                children: [
-                  Icon(
-                    data.collapsed
-                        ? Icons.chevron_right
-                        : Icons.keyboard_arrow_down,
-                    size: 20,
-                  ),
-                  const SizedBox(width: 4),
-                  Expanded(
-                    child: Text(
-                      _headerText(),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.labelLarge,
-                    ),
-                  ),
-                ],
-              ),
-            ),
+    final selected = state._selected == el;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => state._select(el),
+      child: _Frame(
+        selected: selected,
+        onMove: (d) => state._drag(el, d),
+        onResize: data.collapsed ? null : (d) => state._resize(el, d),
+        child: Container(
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest.withValues(alpha: 0.9),
+            border: Border(left: BorderSide(color: scheme.primary, width: 3)),
+            borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
           ),
-          if (!data.collapsed) ...[
-            SizedBox(
-              height: data.height,
-              child: Scrollbar(
-                controller: block.scroll,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              InkWell(
+                onTap: () {
+                  state.rebuild(() => data.collapsed = !data.collapsed);
+                },
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                  child: QuillEditor.basic(
-                    controller: block.quill!,
-                    focusNode: block.focus,
-                    scrollController: block.scroll,
-                    config: const QuillEditorConfig(
-                      scrollable: true,
-                      expands: false,
-                      autoFocus: false,
-                      placeholder: 'Subnote…',
-                    ),
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                  child: Row(
+                    children: [
+                      Icon(
+                        data.collapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 2),
+                      Expanded(
+                        child: Text(
+                          _headerText,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.labelLarge,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ),
-            _ResizeHandle(
-              onDrag: (dy) {
-                data.height = (data.height + dy).clamp(
-                  SubnoteBlockData.minHeight,
-                  SubnoteBlockData.maxHeight,
-                );
-                onChanged();
-              },
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  String _headerText() {
-    final text = block.quill?.document.toPlainText().trim() ?? data.preview;
-    if (text.isEmpty) return 'Subnote';
-    final firstLine = text.split('\n').first;
-    return firstLine.length > 60 ? '${firstLine.substring(0, 60)}…' : firstLine;
-  }
-}
-
-/// A draggable bar at the bottom of a subnote used to resize its box height.
-class _ResizeHandle extends StatelessWidget {
-  const _ResizeHandle({required this.onDrag});
-
-  /// Called with the vertical drag delta (pixels) as the user drags.
-  final ValueChanged<double> onDrag;
-
-  @override
-  Widget build(BuildContext context) {
-    return MouseRegion(
-      cursor: SystemMouseCursors.resizeUpDown,
-      child: GestureDetector(
-        onVerticalDragUpdate: (d) => onDrag(d.delta.dy),
-        child: Container(
-          height: 18,
-          alignment: Alignment.center,
-          child: Container(
-            width: 32,
-            height: 4,
-            decoration: BoxDecoration(
-              color: Theme.of(context).disabledColor,
-              borderRadius: BorderRadius.circular(2),
-            ),
+              if (!data.collapsed)
+                Expanded(
+                  child: TextField(
+                    controller: el.textController,
+                    focusNode: el.focus,
+                    readOnly: !selected,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    style: TextStyle(
+                      fontSize: data.fontSize,
+                      color: data.color != null ? Color(data.color!) : null,
+                    ),
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: InputBorder.none,
+                      hintText: 'Subnote…',
+                      contentPadding: EdgeInsets.fromLTRB(8, 0, 8, 8),
+                    ),
+                    onChanged: (_) => state.rebuild(),
+                  ),
+                ),
+            ],
           ),
         ),
       ),
+    );
+  }
+}
+
+/// Wraps a selected element with a highlight frame, a top move bar, and a
+/// bottom-right resize handle. When not selected it just shows [child].
+class _Frame extends StatelessWidget {
+  const _Frame({
+    required this.selected,
+    required this.child,
+    required this.onMove,
+    this.onResize,
+  });
+
+  final bool selected;
+  final Widget child;
+  final ValueChanged<DragUpdateDetails> onMove;
+  final ValueChanged<DragUpdateDetails>? onResize;
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    if (!selected) {
+      return Container(
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.transparent),
+        ),
+        child: child,
+      );
+    }
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: primary, width: 1.5),
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: child,
+        ),
+        // Move bar along the top edge.
+        Positioned(
+          left: 0,
+          right: 0,
+          top: -14,
+          height: 14,
+          child: MouseRegion(
+            cursor: SystemMouseCursors.move,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanUpdate: onMove,
+              child: Container(
+                color: primary,
+                alignment: Alignment.center,
+                child: const Icon(Icons.drag_indicator, size: 12, color: Colors.white),
+              ),
+            ),
+          ),
+        ),
+        if (onResize != null)
+          Positioned(
+            right: -6,
+            bottom: -6,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.resizeDownRight,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onPanUpdate: onResize,
+                child: Container(
+                  width: 16,
+                  height: 16,
+                  decoration: BoxDecoration(
+                    color: primary,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.open_in_full, size: 10, color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

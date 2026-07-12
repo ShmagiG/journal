@@ -1,23 +1,13 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_localizations/flutter_localizations.dart';
-import 'package:flutter_quill/flutter_quill.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:journal/data/database.dart';
-import 'package:journal/models/blocks.dart';
+import 'package:journal/models/elements.dart';
 import 'package:journal/screens/entry_editor_screen.dart';
 
-Widget _host(AppDatabase db, DateTime day) => MaterialApp(
-  localizationsDelegates: const [
-    GlobalMaterialLocalizations.delegate,
-    GlobalWidgetsLocalizations.delegate,
-    GlobalCupertinoLocalizations.delegate,
-    FlutterQuillLocalizations.delegate,
-  ],
-  supportedLocales: FlutterQuillLocalizations.supportedLocales,
-  home: EntryEditorScreen(database: db, date: day),
-);
+Widget _host(AppDatabase db, DateTime day) =>
+    MaterialApp(home: EntryEditorScreen(database: db, date: day));
 
 /// Pumps the editor and lets its async `_load()` settle past the spinner.
 Future<void> _openEditor(WidgetTester tester, AppDatabase db, DateTime day) async {
@@ -27,35 +17,43 @@ Future<void> _openEditor(WidgetTester tester, AppDatabase db, DateTime day) asyn
 }
 
 void main() {
-  testWidgets('renders seeded text and subnote blocks', (tester) async {
+  testWidgets('renders a seeded text box and a collapsed subnote', (tester) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
       final day = DateTime(2026, 7, 10);
       await db.saveEntry(
         day,
-        blocks: [
-          textBlock('main hello'),
-          SubnoteBlockData(
-            delta: [
-              {'insert': 'aside note\n'},
-            ],
-            collapsed: true,
+        elements: [
+          PlacedElement(
+            x: 20,
+            y: 20,
+            width: 200,
+            data: TextElementData(text: 'main hello'),
+          ),
+          PlacedElement(
+            x: 240,
+            y: 20,
+            width: 180,
+            height: 120,
+            data: SubnoteElementData(text: 'aside note', collapsed: true),
           ),
         ],
       );
 
       await _openEditor(tester, db, day);
 
-      // The collapsed subnote shows its preview in the header.
+      // The text element shows its content, and the collapsed subnote shows its
+      // preview in the header.
+      expect(find.text('main hello'), findsOneWidget);
       expect(find.text('aside note'), findsOneWidget);
-      // Collapsed subnote has no editor, so only the text block's editor shows.
-      expect(find.byType(QuillEditor), findsOneWidget);
+      // Collapsed: header shows a right chevron.
+      expect(find.byIcon(Icons.chevron_right), findsOneWidget);
 
       await db.close();
     });
   });
 
-  testWidgets('expanding a subnote reveals its editor and resize handle', (
+  testWidgets('expanding a collapsed subnote flips its header chevron', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -63,35 +61,42 @@ void main() {
       final day = DateTime(2026, 7, 10);
       await db.saveEntry(
         day,
-        blocks: [
-          textBlock('main'),
-          SubnoteBlockData(
-            delta: [
-              {'insert': 'aside\n'},
-            ],
-            collapsed: true,
+        elements: [
+          PlacedElement(
+            x: 40,
+            y: 40,
+            width: 180,
+            height: 120,
+            data: SubnoteElementData(text: 'aside', collapsed: true),
           ),
         ],
       );
       await _openEditor(tester, db, day);
 
-      expect(find.byType(QuillEditor), findsOneWidget);
       expect(find.byIcon(Icons.chevron_right), findsOneWidget);
 
       await tester.tap(find.byIcon(Icons.chevron_right));
       await tester.pump();
 
-      // Now the subnote's editor is shown alongside the text block's.
-      expect(find.byType(QuillEditor), findsNWidgets(2));
+      // Expanded now: chevron points down.
       expect(find.byIcon(Icons.keyboard_arrow_down), findsOneWidget);
+      expect(find.byIcon(Icons.chevron_right), findsNothing);
 
       await db.close();
     });
   });
 
-}
+  testWidgets('the draw tool exposes pen options', (tester) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      await _openEditor(tester, db, DateTime(2026, 7, 10));
 
-/// A text block containing a single plain paragraph.
-TextBlockData textBlock(String text) => TextBlockData([
-  {'insert': '$text\n'},
-]);
+      // Switch to the draw tool; a pen width slider should appear.
+      await tester.tap(find.byIcon(Icons.edit));
+      await tester.pump();
+      expect(find.byType(Slider), findsOneWidget);
+
+      await db.close();
+    });
+  });
+}

@@ -30,10 +30,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_localizations:   # localization delegates (required by flutter_quill)
-    sdk: flutter
-  flutter_quill: ^11.5.1   # rich text
-  scribble: ^0.10.0        # drawing
   drift: ^2.18.0           # local SQLite storage
   drift_flutter: ^0.3.0
   intl: ^0.20.2            # date formatting

@@ -4,6 +4,7 @@ import 'package:drift/drift.dart';
 import 'package:drift_flutter/drift_flutter.dart';
 
 import '../models/blocks.dart';
+import '../models/elements.dart';
 
 part 'database.g.dart';
 
@@ -34,9 +35,9 @@ class Entries extends Table {
   DateTimeColumn get updatedAt => dateTime().withDefault(currentDateAndTime)();
 }
 
-/// One content block belonging to an [Entries] row. Blocks are ordered by
-/// [position]; [type] discriminates the block kind ('text', 'subnote', …) and
-/// [data] holds its JSON payload (see [BlockData]).
+/// Legacy ordered-block table, superseded by [Elements]. Kept defined only so
+/// the v3→v4 migration can read pre-canvas rows and fold them into the new
+/// canvas model; no live code writes to it.
 class Blocks extends Table {
   IntColumn get id => integer().autoIncrement()();
 
@@ -49,11 +50,40 @@ class Blocks extends Table {
   /// Block-kind discriminator, e.g. 'text' or 'subnote'.
   TextColumn get type => text()();
 
-  /// JSON-encoded [BlockData.toJson] payload for this block.
+  /// JSON-encoded block payload.
   TextColumn get data => text()();
 }
 
-@DriftDatabase(tables: [Entries, Blocks])
+/// One element placed on an [Entries] canvas. Elements are absolutely
+/// positioned at ([x], [y]), optionally sized ([width]/[height] — null for
+/// strokes, which derive their bounds from their points), and layered by [z].
+/// [type] discriminates the kind ('text', 'subnote', 'stroke', …) and [data]
+/// holds its JSON content payload (see [ElementData]).
+class Elements extends Table {
+  IntColumn get id => integer().autoIncrement()();
+
+  IntColumn get entryId =>
+      integer().references(Entries, #id, onDelete: KeyAction.cascade)();
+
+  /// Canvas coordinates of the element's top-left corner, in logical pixels.
+  RealColumn get x => real()();
+  RealColumn get y => real()();
+
+  /// Box size for text/subnote elements; null for strokes.
+  RealColumn get width => real().nullable()();
+  RealColumn get height => real().nullable()();
+
+  /// Layer order; higher paints on top.
+  IntColumn get z => integer().withDefault(const Constant(0))();
+
+  /// Element-kind discriminator, e.g. 'text', 'subnote' or 'stroke'.
+  TextColumn get type => text()();
+
+  /// JSON-encoded [ElementData.toJson] payload for this element.
+  TextColumn get data => text()();
+}
+
+@DriftDatabase(tables: [Entries, Blocks, Elements])
 class AppDatabase extends _$AppDatabase {
   /// Pass a custom [executor] (e.g. an in-memory database) in tests; the app
   /// uses [driftDatabase] for platform-appropriate on-disk storage.
@@ -61,7 +91,7 @@ class AppDatabase extends _$AppDatabase {
     : super(executor ?? driftDatabase(name: 'journal'));
 
   @override
-  int get schemaVersion => 3;
+  int get schemaVersion => 4;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -92,12 +122,76 @@ class AppDatabase extends _$AppDatabase {
           );
         }
       }
+      if (from < 4) await _migrateBlocksToElements(m);
     },
-    // Required for the Blocks -> Entries cascade delete to take effect.
+    // Required for the cascade deletes to take effect.
     beforeOpen: (details) async {
       await customStatement('PRAGMA foreign_keys = ON');
     },
   );
+
+  /// v3→v4: fold the ordered [Blocks] of every entry into positioned canvas
+  /// [Elements], stacked vertically down the left of the canvas so migrated
+  /// content lands somewhere sensible. Quill deltas are flattened to plain text
+  /// (rich formatting is not carried into the plain-text-first canvas model).
+  Future<void> _migrateBlocksToElements(Migrator m) async {
+    await m.createTable(elements);
+    const leftMargin = 24.0;
+    const topMargin = 24.0;
+    const gap = 16.0;
+    const textWidth = 320.0;
+    // Rough height estimate per element so stacked items don't overlap.
+    double estimateHeight(String text, double fontSize) {
+      final lines = (text.isEmpty ? 1 : '\n'.allMatches(text).length + 1);
+      return (lines * fontSize * 1.4 + 24).clamp(48.0, 400.0);
+    }
+
+    final legacyBlocks =
+        await (select(blocks)..orderBy([
+              (t) => OrderingTerm.asc(t.entryId),
+              (t) => OrderingTerm.asc(t.position),
+            ]))
+            .get();
+
+    int? currentEntry;
+    double y = topMargin;
+    for (final b in legacyBlocks) {
+      if (b.entryId != currentEntry) {
+        currentEntry = b.entryId;
+        y = topMargin;
+      }
+      final json = jsonDecode(b.data) as Map<String, dynamic>;
+      final delta = (json['delta'] as List?) ?? const [];
+      final text = plainTextFromDelta(delta);
+      if (text.trim().isEmpty) continue;
+
+      final ElementData data;
+      final double fontSize;
+      if (b.type == SubnoteBlockData.kType) {
+        fontSize = SubnoteElementData.defaultFontSize;
+        data = SubnoteElementData(
+          text: text,
+          collapsed: (json['collapsed'] as bool?) ?? false,
+        );
+      } else {
+        fontSize = TextElementData.defaultFontSize;
+        data = TextElementData(text: text);
+      }
+      final h = estimateHeight(text, fontSize);
+      await into(elements).insert(
+        ElementsCompanion.insert(
+          entryId: b.entryId,
+          x: leftMargin,
+          y: y,
+          width: Value(b.type == SubnoteBlockData.kType ? SubnoteElementData.defaultWidth : textWidth),
+          height: Value(h),
+          type: data.type,
+          data: jsonEncode(data.toJson()),
+        ),
+      );
+      y += h + gap;
+    }
+  }
 
   /// Strips the time component, giving the local-midnight key for a day.
   static DateTime dateOnly(DateTime d) => DateTime(d.year, d.month, d.day);
@@ -114,30 +208,33 @@ class AppDatabase extends _$AppDatabase {
     return (select(entries)..where((t) => t.date.equals(key))).getSingleOrNull();
   }
 
-  /// The blocks of [entryId], in [Blocks.position] order.
-  Future<List<Block>> blocksForEntry(int entryId) {
-    return (select(blocks)
+  /// The canvas elements of [entryId], in [Elements.z] (layer) order.
+  Future<List<Element>> elementsForEntry(int entryId) {
+    return (select(elements)
           ..where((t) => t.entryId.equals(entryId))
-          ..orderBy([(t) => OrderingTerm.asc(t.position)]))
+          ..orderBy([
+            (t) => OrderingTerm.asc(t.z),
+            (t) => OrderingTerm.asc(t.id),
+          ]))
         .get();
   }
 
-  /// Persists the entry for [day]: its [title] and the ordered [blocks].
+  /// Persists the entry for [day]: its [title] and its canvas [elements].
   ///
-  /// Empty blocks are dropped. If nothing meaningful remains (no title and no
-  /// non-empty block) the entry is deleted (or never created), mirroring the
-  /// old empty-entry cleanup. Blocks are rewritten wholesale in one
-  /// transaction, so insert/delete/reorder all persist uniformly.
+  /// Empty elements are dropped. If nothing meaningful remains (no title and no
+  /// non-empty element) the entry is deleted (or never created), mirroring the
+  /// old empty-entry cleanup. Elements are rewritten wholesale in one
+  /// transaction, so add/delete/move all persist uniformly.
   Future<void> saveEntry(
     DateTime day, {
     String? title,
-    required List<BlockData> blocks,
+    required List<PlacedElement> elements,
   }) {
     final key = dateOnly(day);
     final normalizedTitle = (title == null || title.trim().isEmpty)
         ? null
         : title.trim();
-    final kept = blocks.where((b) => !b.isEmpty).toList();
+    final kept = elements.where((e) => !e.data.isEmpty).toList();
 
     return transaction(() async {
       final existing = await entryForDate(key);
@@ -168,15 +265,20 @@ class AppDatabase extends _$AppDatabase {
         );
       }
 
-      await (delete(this.blocks)..where((t) => t.entryId.equals(entryId))).go();
+      await (delete(this.elements)..where((t) => t.entryId.equals(entryId)))
+          .go();
       for (var i = 0; i < kept.length; i++) {
-        final block = kept[i];
-        await into(this.blocks).insert(
-          BlocksCompanion.insert(
+        final el = kept[i];
+        await into(this.elements).insert(
+          ElementsCompanion.insert(
             entryId: entryId,
-            position: i,
-            type: block.type,
-            data: jsonEncode(block.toJson()),
+            x: el.x,
+            y: el.y,
+            width: Value(el.width),
+            height: Value(el.height),
+            z: Value(el.z),
+            type: el.data.type,
+            data: jsonEncode(el.data.toJson()),
           ),
         );
       }
@@ -187,10 +289,10 @@ class AppDatabase extends _$AppDatabase {
     return (delete(entries)..where((t) => t.id.equals(id))).go();
   }
 
-  /// First non-empty block preview, capped to a reasonable length.
-  static String _previewFor(List<BlockData> blocks) {
-    for (final block in blocks) {
-      final p = block.preview.trim();
+  /// First non-empty element preview, capped to a reasonable length.
+  static String _previewFor(List<PlacedElement> elements) {
+    for (final el in elements) {
+      final p = el.data.preview.trim();
       if (p.isNotEmpty) return p.length > 140 ? p.substring(0, 140) : p;
     }
     return '';
