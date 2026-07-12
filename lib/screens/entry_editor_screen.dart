@@ -123,17 +123,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     if (entry != null) {
       final rows = await widget.database.elementsForEntry(entry.id);
       for (final r in rows) {
-        loaded.add(
-          _CanvasElement(
-            key: _nextKey++,
-            data: ElementData.decode(r.type, r.data),
-            x: r.x,
-            y: r.y,
-            width: r.width,
-            height: r.height,
-            z: r.z,
-          ),
+        final el = _CanvasElement(
+          key: _nextKey++,
+          data: ElementData.decode(r.type, r.data),
+          x: r.x,
+          y: r.y,
+          width: r.width,
+          height: r.height,
+          z: r.z,
         );
+        _attachFocus(el);
+        loaded.add(el);
       }
     }
     if (!mounted) return;
@@ -159,6 +159,19 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     setState(() => _selected = el);
   }
 
+  /// Selecting a text/subnote follows keyboard focus: when a box's editor gains
+  /// focus (e.g. the user taps into it) it becomes the selected element, so the
+  /// selection frame and format toolbar target what's being edited.
+  void _attachFocus(_CanvasElement el) {
+    final f = el.focus;
+    if (f == null) return;
+    f.addListener(() {
+      if (f.hasFocus && _selected != el) {
+        setState(() => _selected = el);
+      }
+    });
+  }
+
   /// Public rebuild hook for child element widgets (they can't call the
   /// protected [setState] directly).
   void rebuild([VoidCallback? mutate]) {
@@ -181,6 +194,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       height: height,
       z: _topZ + 1,
     );
+    _attachFocus(el);
     setState(() {
       _elements.add(el);
       _selected = el;
@@ -195,7 +209,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       y: canvasPoint.dy,
       width: 220,
     );
-    setState(() => _tool = _Tool.select);
+    // Stay in text mode so tapping empty canvas keeps adding boxes; the new box
+    // is focused so the user can type immediately.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) el.focus?.requestFocus();
     });
@@ -276,8 +291,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   void _onCanvasTap(Offset canvasPoint) {
     switch (_tool) {
       case _Tool.text:
+        // Tapping empty canvas creates a new text box; tapping an existing box
+        // hits the box (not this background), so it edits instead of creating.
         _addTextAt(canvasPoint);
       case _Tool.select:
+        FocusScope.of(context).unfocus();
         _select(null);
       case _Tool.draw:
         break;
@@ -794,28 +812,26 @@ class _TextBox extends StatelessWidget {
       fontSize: data.fontSize,
       color: data.color != null ? Color(data.color!) : null,
     );
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => state._select(el),
-      child: _Frame(
-        selected: selected,
-        onMove: (d) => state._drag(el, d),
-        onResize: (d) => state._resize(el, d),
-        child: TextField(
-          controller: el.textController,
-          focusNode: el.focus,
-          readOnly: !selected,
-          maxLines: null,
-          style: style,
-          cursorColor: Theme.of(context).colorScheme.primary,
-          decoration: InputDecoration(
-            isDense: true,
-            border: InputBorder.none,
-            hintText: selected ? 'Write…' : null,
-            contentPadding: const EdgeInsets.all(6),
-          ),
-          onChanged: (_) => state.rebuild(),
+    // The TextField is always editable: tapping it focuses it (which selects the
+    // box via the focus listener) and places the caret so the user can type.
+    // Moving/resizing happen on the surrounding frame, not on the text itself.
+    return _Frame(
+      selected: selected,
+      onMove: (d) => state._drag(el, d),
+      onResize: (d) => state._resize(el, d),
+      child: TextField(
+        controller: el.textController,
+        focusNode: el.focus,
+        maxLines: null,
+        style: style,
+        cursorColor: Theme.of(context).colorScheme.primary,
+        decoration: const InputDecoration(
+          isDense: true,
+          border: InputBorder.none,
+          hintText: 'Write…',
+          contentPadding: EdgeInsets.all(6),
         ),
+        onChanged: (_) => state.rebuild(),
       ),
     );
   }
@@ -841,14 +857,13 @@ class _SubnoteCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final selected = state._selected == el;
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => state._select(el),
-      child: _Frame(
-        selected: selected,
-        onMove: (d) => state._drag(el, d),
-        onResize: data.collapsed ? null : (d) => state._resize(el, d),
-        child: Container(
+    // Selection/move is driven by the header handle below; the body TextField is
+    // always editable and tapping it focuses (and thereby selects) the note.
+    return _Frame(
+      selected: selected,
+      onMove: (d) => state._drag(el, d),
+      onResize: data.collapsed ? null : (d) => state._resize(el, d),
+      child: Container(
           decoration: BoxDecoration(
             color: scheme.surfaceContainerHighest.withValues(alpha: 0.9),
             border: Border(left: BorderSide(color: scheme.primary, width: 3)),
@@ -909,7 +924,6 @@ class _SubnoteCard extends StatelessWidget {
                   child: TextField(
                     controller: el.textController,
                     focusNode: el.focus,
-                    readOnly: !selected,
                     maxLines: null,
                     expands: true,
                     textAlignVertical: TextAlignVertical.top,
@@ -929,8 +943,7 @@ class _SubnoteCard extends StatelessWidget {
             ],
           ),
         ),
-      ),
-    );
+      );
   }
 }
 

@@ -86,6 +86,38 @@ void main() {
     });
   });
 
+  testWidgets('tapping a text box lets you edit its text', (tester) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime(2026, 7, 10);
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 220,
+            data: TextElementData(text: 'hello'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      final field = find.widgetWithText(TextField, 'hello');
+      expect(field, findsOneWidget);
+
+      await tester.tap(field);
+      await tester.pump();
+      // enterText only succeeds on an editable (non-readOnly, focusable) field.
+      await tester.enterText(field, 'hello world');
+      await tester.pump();
+
+      expect(find.text('hello world'), findsOneWidget);
+
+      await db.close();
+    });
+  });
+
   testWidgets('a subnote can be dragged by its header to move it', (
     tester,
   ) async {
