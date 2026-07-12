@@ -20,7 +20,7 @@ void main() {
   testWidgets('renders a seeded text box and a collapsed subnote', (tester) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      final day = DateTime(2026, 7, 10);
+      final day = DateTime.now();
       await db.saveEntry(
         day,
         elements: [
@@ -58,7 +58,7 @@ void main() {
   ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      final day = DateTime(2026, 7, 10);
+      final day = DateTime.now();
       await db.saveEntry(
         day,
         elements: [
@@ -89,7 +89,7 @@ void main() {
   testWidgets('tapping a text box lets you edit its text', (tester) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      final day = DateTime(2026, 7, 10);
+      final day = DateTime.now();
       await db.saveEntry(
         day,
         elements: [
@@ -127,7 +127,7 @@ void main() {
   ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      final day = DateTime(2026, 7, 10);
+      final day = DateTime.now();
       await db.saveEntry(
         day,
         elements: [
@@ -176,7 +176,7 @@ void main() {
   ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      await _openEditor(tester, db, DateTime(2026, 7, 10));
+      await _openEditor(tester, db, DateTime.now());
 
       // Text tool, then tap empty canvas to create a new (empty) box.
       await tester.tap(find.byIcon(Icons.text_fields));
@@ -199,7 +199,7 @@ void main() {
   ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      final day = DateTime(2026, 7, 10);
+      final day = DateTime.now();
       await db.saveEntry(
         day,
         elements: [
@@ -227,10 +227,89 @@ void main() {
     });
   });
 
+  testWidgets('the timestamp button inserts HH:mm:ss on a new line', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 220,
+            data: TextElementData(text: 'note'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      // Focus the box under the text tool, then insert the timestamp.
+      await tester.tap(find.byIcon(Icons.text_fields));
+      await tester.pump();
+      await tester.tap(find.widgetWithText(TextField, 'note'));
+      await tester.pump();
+
+      await tester.tap(find.byIcon(Icons.schedule));
+      await tester.pump();
+
+      expect(
+        find.textContaining(RegExp(r'note\n\d{2}:\d{2}:\d{2}\n')),
+        findsOneWidget,
+      );
+
+      await db.close();
+    });
+  });
+
+  testWidgets('a past day is read-only: no tools, text not editable', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final past = DateTime.now().subtract(const Duration(days: 2));
+      await db.saveEntry(
+        past,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 220,
+            data: TextElementData(text: 'old entry'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, past);
+
+      // Content still renders, but the authoring tools are gone.
+      expect(find.text('old entry'), findsOneWidget);
+      expect(find.textContaining('Read-only'), findsOneWidget);
+      expect(find.byIcon(Icons.text_fields), findsNothing);
+      expect(find.byIcon(Icons.edit), findsNothing);
+      expect(find.byIcon(Icons.sticky_note_2_outlined), findsNothing);
+
+      // The text cannot be changed.
+      final field = find.widgetWithText(TextField, 'old entry');
+      await tester.enterText(field, 'tampered');
+      await tester.pump();
+      expect(find.text('old entry'), findsOneWidget);
+      expect(find.text('tampered'), findsNothing);
+
+      // Tapping it does not select it (no move/resize handles appear).
+      await tester.tap(field, warnIfMissed: false);
+      await tester.pump();
+      expect(find.byIcon(Icons.open_in_full), findsNothing);
+
+      await db.close();
+    });
+  });
+
   testWidgets('the draw tool exposes pen options', (tester) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
-      await _openEditor(tester, db, DateTime(2026, 7, 10));
+      await _openEditor(tester, db, DateTime.now());
 
       // Switch to the draw tool; a pen width slider should appear.
       await tester.tap(find.byIcon(Icons.edit));

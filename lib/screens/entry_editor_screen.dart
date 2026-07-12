@@ -2,6 +2,7 @@ import 'dart:ui' show PointMode;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../data/database.dart';
@@ -95,8 +96,12 @@ class EntryEditorScreen extends StatefulWidget {
 class _EntryEditorScreenState extends State<EntryEditorScreen> {
   final _titleController = TextEditingController();
   final _transform = TransformationController();
+
+  /// Keeps the timestamp button from taking focus away from the editor it is
+  /// meant to insert into.
+  final _timestampFocus = FocusNode(canRequestFocus: false, skipTraversal: true);
+
   final List<_CanvasElement> _elements = [];
-  Entry? _entry;
   bool _loading = true;
   int _nextKey = 0;
 
@@ -139,7 +144,6 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     }
     if (!mounted) return;
     setState(() {
-      _entry = entry;
       _titleController.text = entry?.title ?? '';
       _elements.addAll(loaded);
       _loading = false;
@@ -156,7 +160,18 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     return _transform.toScene(screenCenter);
   }
 
+  /// Only today's entry can be changed — past days are a read-only record.
+  bool get _readOnly =>
+      AppDatabase.dateOnly(widget.date) != AppDatabase.dateOnly(DateTime.now());
+
+  /// Whether elements can currently be moved/resized/selected.
+  bool get _moveEnabled => !_readOnly && _tool == _Tool.select;
+
+  /// Whether text/subnote editors are live (text tool, and not read-only).
+  bool get _textEditing => !_readOnly && _tool == _Tool.text;
+
   void _select(_CanvasElement? el) {
+    if (_readOnly) return;
     setState(() => _selected = el);
   }
 
@@ -168,6 +183,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     final f = el.focus;
     if (f == null) return;
     f.addListener(() {
+      // A read-only (past) entry never selects or mutates anything, even if a
+      // field somehow takes focus.
+      if (_readOnly) return;
       if (f.hasFocus) {
         if (_selected != el) setState(() => _selected = el);
       } else {
@@ -318,10 +336,55 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     }
   }
 
+  // --- Timestamp -----------------------------------------------------------
+
+  /// The text/subnote element whose editor currently has focus, if any.
+  _CanvasElement? get _focusedTextElement {
+    for (final el in _elements) {
+      if ((el.focus?.hasFocus ?? false) && el.textController != null) return el;
+    }
+    return null;
+  }
+
+  /// Inserts the current `HH:mm:ss` on its own new line in the focused text box
+  /// or subnote, leaving the caret on the line below it. Bound to Ctrl+T and the
+  /// clock toolbar button.
+  void _insertTimestamp() {
+    if (_readOnly) return;
+    final el = _focusedTextElement;
+    if (el == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Place the cursor in a text box or subnote first.'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+    final c = el.textController!;
+    final stamp = DateFormat('HH:mm:ss').format(DateTime.now());
+    final text = c.text;
+    final sel = c.selection;
+    final at = (sel.isValid ? sel.end : text.length).clamp(0, text.length);
+
+    final before = text.substring(0, at);
+    final after = text.substring(at);
+    // Start a new line unless we're already at the start of one.
+    final lead = (before.isEmpty || before.endsWith('\n')) ? '' : '\n';
+    final insertion = '$lead$stamp\n';
+
+    c.value = TextEditingValue(
+      text: '$before$insertion$after',
+      selection: TextSelection.collapsed(offset: before.length + insertion.length),
+    );
+    el.syncToData();
+    setState(() {});
+  }
+
   // --- Save ----------------------------------------------------------------
 
   Future<void> _save() async {
-    if (_loading) return;
+    if (_loading || _readOnly) return;
     for (final el in _elements) {
       el.syncToData();
     }
@@ -332,17 +395,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     );
   }
 
-  Future<void> _delete() async {
-    if (_entry != null) {
-      await widget.database.deleteEntry(_entry!.id);
-    }
-    if (mounted) Navigator.of(context).pop();
-  }
-
   @override
   void dispose() {
     _titleController.dispose();
     _transform.dispose();
+    _timestampFocus.dispose();
     for (final el in _elements) {
       el.dispose();
     }
@@ -356,39 +413,38 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) _save();
       },
-      child: Scaffold(
-        appBar: AppBar(
-          title: Text(DateFormat.yMMMMEEEEd().format(widget.date)),
-          actions: [
-            if (_entry != null)
-              IconButton(
-                icon: const Icon(Icons.delete_outline),
-                tooltip: 'Delete entry',
-                onPressed: _delete,
-              ),
-          ],
-        ),
-        body: _loading
-            ? const Center(child: CircularProgressIndicator())
-            : Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                    child: TextField(
-                      controller: _titleController,
-                      style: Theme.of(context).textTheme.titleLarge,
-                      decoration: const InputDecoration(
-                        border: InputBorder.none,
-                        hintText: 'Title (optional)',
+      child: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.keyT, control: true):
+              _insertTimestamp,
+        },
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text(DateFormat.yMMMMEEEEd().format(widget.date)),
+          ),
+          body: _loading
+              ? const Center(child: CircularProgressIndicator())
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      child: TextField(
+                        controller: _titleController,
+                        readOnly: _readOnly,
+                        style: Theme.of(context).textTheme.titleLarge,
+                        decoration: const InputDecoration(
+                          border: InputBorder.none,
+                          hintText: 'Title (optional)',
+                        ),
                       ),
                     ),
-                  ),
-                  _toolbar(context),
-                  const Divider(height: 1),
-                  Expanded(child: _canvas(context)),
-                ],
-              ),
+                    _toolbar(context),
+                    const Divider(height: 1),
+                    Expanded(child: _canvas(context)),
+                  ],
+                ),
+        ),
       ),
     );
   }
@@ -396,6 +452,34 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   // --- Toolbar -------------------------------------------------------------
 
   Widget _toolbar(BuildContext context) {
+    // Past days are a read-only record: no tools, just a notice and the view
+    // reset. Only today's entry can be authored.
+    if (_readOnly) {
+      final scheme = Theme.of(context).colorScheme;
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+        child: Row(
+          children: [
+            Icon(Icons.lock_outline, size: 16, color: scheme.outline),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                'Read-only — you can only edit today\'s entry.',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: scheme.outline),
+              ),
+            ),
+            IconButton(
+              icon: const Icon(Icons.center_focus_strong),
+              tooltip: 'Reset view',
+              onPressed: () => _transform.value = Matrix4.identity(),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -411,6 +495,15 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                 icon: const Icon(Icons.sticky_note_2_outlined),
                 tooltip: 'Add subnote',
                 onPressed: _addSubnote,
+              ),
+              IconButton(
+                // Must not steal focus from the editor being typed in, or the
+                // timestamp would have nowhere to go (and an empty box would be
+                // discarded on blur).
+                focusNode: _timestampFocus,
+                icon: const Icon(Icons.schedule),
+                tooltip: 'Insert timestamp (Ctrl+T)',
+                onPressed: _insertTimestamp,
               ),
               const Spacer(),
               IconButton(
@@ -665,7 +758,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       return _positioned(
         el,
         _DragSurface(
-          enabled: _tool == _Tool.select,
+          enabled: _moveEnabled,
           onSelect: () => _select(el),
           onDelta: (d) => _drag(el, d),
           child: CustomPaint(
@@ -906,7 +999,7 @@ class _TextBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final selected = state._selected == el;
-    final editing = state._tool == _Tool.text;
+    final editing = state._textEditing;
     final style = TextStyle(
       fontSize: data.fontSize,
       color: data.color != null ? Color(data.color!) : null,
@@ -949,7 +1042,7 @@ class _TextBox extends StatelessWidget {
           IgnorePointer(child: field),
           Positioned.fill(
             child: _DragSurface(
-              enabled: state._tool == _Tool.select,
+              enabled: state._moveEnabled,
               onSelect: () => state._select(el),
               onDelta: (d) => state._drag(el, d),
               child: const SizedBox.expand(),
@@ -981,7 +1074,7 @@ class _SubnoteCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final selected = state._selected == el;
-    final editing = state._tool == _Tool.text;
+    final editing = state._textEditing;
 
     // The chevron stays OUTSIDE the drag surface: the eager pan recognizer
     // claims the gesture on pointer-down, so anything inside the surface can no
@@ -1006,7 +1099,7 @@ class _SubnoteCard extends StatelessWidget {
             child: MouseRegion(
               cursor: SystemMouseCursors.move,
               child: _DragSurface(
-                enabled: state._tool == _Tool.select,
+                enabled: state._moveEnabled,
                 onSelect: () => state._select(el),
                 onDelta: (d) => state._drag(el, d),
                 child: Row(
@@ -1071,7 +1164,7 @@ class _SubnoteCard extends StatelessWidget {
               child: editing
                   ? body
                   : _DragSurface(
-                      enabled: state._tool == _Tool.select,
+                      enabled: state._moveEnabled,
                       onSelect: () => state._select(el),
                       onDelta: (d) => state._drag(el, d),
                       child: IgnorePointer(child: body),
