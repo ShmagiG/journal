@@ -1,5 +1,6 @@
 import 'dart:ui' show PointMode;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -161,15 +162,30 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   /// Selecting a text/subnote follows keyboard focus: when a box's editor gains
   /// focus (e.g. the user taps into it) it becomes the selected element, so the
-  /// selection frame and format toolbar target what's being edited.
+  /// selection frame and format toolbar target what's being edited. On losing
+  /// focus, a text box left empty (created but never written in) is discarded.
   void _attachFocus(_CanvasElement el) {
     final f = el.focus;
     if (f == null) return;
     f.addListener(() {
-      if (f.hasFocus && _selected != el) {
-        setState(() => _selected = el);
+      if (f.hasFocus) {
+        if (_selected != el) setState(() => _selected = el);
+      } else {
+        el.syncToData();
+        if (el.data is TextElementData && el.data.isEmpty) {
+          _removeElement(el);
+        }
       }
     });
+  }
+
+  void _removeElement(_CanvasElement el) {
+    if (!_elements.contains(el)) return;
+    setState(() {
+      _elements.remove(el);
+      if (_selected == el) _selected = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
   }
 
   /// Public rebuild hook for child element widgets (they can't call the
@@ -417,7 +433,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       tooltip: tip,
       isSelected: active,
       color: active ? Theme.of(context).colorScheme.primary : null,
-      onPressed: () => setState(() => _tool = tool),
+      onPressed: () {
+        // Dropping focus first discards any empty text box being left behind and
+        // makes text non-interactive in select/draw mode.
+        FocusScope.of(context).unfocus();
+        setState(() => _tool = tool);
+      },
     );
   }
 
@@ -643,10 +664,10 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     if (data is StrokeElementData) {
       return _positioned(
         el,
-        GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () => _select(el),
-          onPanUpdate: _tool == _Tool.select ? (d) => _drag(el, d) : null,
+        _DragSurface(
+          enabled: _tool == _Tool.select,
+          onSelect: () => _select(el),
+          onDelta: (d) => _drag(el, d),
           child: CustomPaint(
             size: Size(el.width ?? 0, el.height ?? 0),
             painter: _StrokePainter(
@@ -700,21 +721,98 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   /// Current InteractiveViewer scale, so screen drag deltas map to canvas px.
   double get _scale => _transform.value.getMaxScaleOnAxis();
 
-  void _drag(_CanvasElement el, DragUpdateDetails d) {
+  /// [delta] is a screen-space drag delta; dividing by [_scale] converts it to
+  /// canvas pixels.
+  void _drag(_CanvasElement el, Offset delta) {
     setState(() {
-      el.x += d.delta.dx / _scale;
-      el.y += d.delta.dy / _scale;
+      el.x += delta.dx / _scale;
+      el.y += delta.dy / _scale;
     });
   }
 
-  void _resize(_CanvasElement el, DragUpdateDetails d) {
+  void _resize(_CanvasElement el, Offset delta) {
     setState(() {
-      el.width = ((el.width ?? 120) + d.delta.dx / _scale).clamp(60.0, 2000.0);
+      el.width = ((el.width ?? 120) + delta.dx / _scale).clamp(60.0, 2000.0);
       // Text boxes grow only horizontally; their height follows their content.
       if (el.data is! TextElementData) {
-        el.height = ((el.height ?? 80) + d.delta.dy / _scale).clamp(40.0, 2000.0);
+        el.height = ((el.height ?? 80) + delta.dy / _scale).clamp(40.0, 2000.0);
       }
     });
+  }
+}
+
+/// A pan recognizer that claims the gesture arena as soon as the pointer goes
+/// down. The canvas's [InteractiveViewer] installs a `ScaleGestureRecognizer`
+/// over the whole surface which otherwise steals element drags (it wins the
+/// arena even with `panEnabled`/`scaleEnabled` false). Accepting eagerly means a
+/// drag that *starts on an element* moves that element instead of panning.
+class _EagerPanRecognizer extends PanGestureRecognizer {
+  @override
+  void addAllowedPointer(PointerDownEvent event) {
+    super.addAllowedPointer(event);
+    resolve(GestureDisposition.accepted);
+  }
+}
+
+/// Drags [child] using an [_EagerPanRecognizer], reporting screen-space deltas.
+/// Because the gesture is claimed on pointer-down, nothing inside [child] can
+/// receive taps — keep buttons outside it.
+class _EagerDrag extends StatelessWidget {
+  const _EagerDrag({required this.onDelta, required this.child, this.onDown});
+
+  final ValueChanged<Offset> onDelta;
+  final VoidCallback? onDown;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return RawGestureDetector(
+      behavior: HitTestBehavior.opaque,
+      gestures: {
+        _EagerPanRecognizer:
+            GestureRecognizerFactoryWithHandlers<_EagerPanRecognizer>(
+              _EagerPanRecognizer.new,
+              (r) {
+                r.onDown = (_) => onDown?.call();
+                r.onUpdate = (d) => onDelta(d.delta);
+              },
+            ),
+      },
+      child: child,
+    );
+  }
+}
+
+/// A surface that selects its element on pointer-down and moves it on drag.
+/// When [enabled] is false (text/draw tool) it only handles taps, leaving drags
+/// to the canvas.
+class _DragSurface extends StatelessWidget {
+  const _DragSurface({
+    required this.enabled,
+    required this.onSelect,
+    required this.onDelta,
+    required this.child,
+  });
+
+  final bool enabled;
+  final VoidCallback onSelect;
+
+  /// Screen-space drag delta.
+  final ValueChanged<Offset> onDelta;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!enabled) {
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onSelect,
+        child: child,
+      );
+    }
+    // Pointer-down selects: a click without movement still selects, since the
+    // eager pan swallows the tap gesture.
+    return _EagerDrag(onDown: onSelect, onDelta: onDelta, child: child);
   }
 }
 
@@ -808,30 +906,56 @@ class _TextBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final selected = state._selected == el;
+    final editing = state._tool == _Tool.text;
     final style = TextStyle(
       fontSize: data.fontSize,
       color: data.color != null ? Color(data.color!) : null,
     );
-    // The TextField is always editable: tapping it focuses it (which selects the
-    // box via the focus listener) and places the caret so the user can type.
-    // Moving/resizing happen on the surrounding frame, not on the text itself.
+
+    final field = TextField(
+      controller: el.textController,
+      focusNode: el.focus,
+      readOnly: !editing,
+      maxLines: null,
+      style: style,
+      cursorColor: Theme.of(context).colorScheme.primary,
+      decoration: const InputDecoration(
+        isDense: true,
+        border: InputBorder.none,
+        hintText: 'Write…',
+        contentPadding: EdgeInsets.all(6),
+      ),
+      onChanged: (_) => state.rebuild(),
+    );
+
+    // Text tool: the field is live — tapping it focuses/edits (and selects via
+    // the focus listener).
+    if (editing) {
+      return _Frame(
+        selected: selected,
+        onMove: (d) => state._drag(el, d),
+        onResize: (d) => state._resize(el, d),
+        child: field,
+      );
+    }
+    // Otherwise the field is inert and a transparent overlay on top of it is the
+    // drag surface: pointer-down selects, a drag moves.
     return _Frame(
       selected: selected,
       onMove: (d) => state._drag(el, d),
       onResize: (d) => state._resize(el, d),
-      child: TextField(
-        controller: el.textController,
-        focusNode: el.focus,
-        maxLines: null,
-        style: style,
-        cursorColor: Theme.of(context).colorScheme.primary,
-        decoration: const InputDecoration(
-          isDense: true,
-          border: InputBorder.none,
-          hintText: 'Write…',
-          contentPadding: EdgeInsets.all(6),
-        ),
-        onChanged: (_) => state.rebuild(),
+      child: Stack(
+        children: [
+          IgnorePointer(child: field),
+          Positioned.fill(
+            child: _DragSurface(
+              enabled: state._tool == _Tool.select,
+              onSelect: () => state._select(el),
+              onDelta: (d) => state._drag(el, d),
+              child: const SizedBox.expand(),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -857,93 +981,112 @@ class _SubnoteCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final selected = state._selected == el;
-    // Selection/move is driven by the header handle below; the body TextField is
-    // always editable and tapping it focuses (and thereby selects) the note.
+    final editing = state._tool == _Tool.text;
+
+    // The chevron stays OUTSIDE the drag surface: the eager pan recognizer
+    // claims the gesture on pointer-down, so anything inside the surface can no
+    // longer receive taps. The rest of the header is the move handle.
+    final header = Padding(
+      padding: const EdgeInsets.fromLTRB(2, 0, 6, 0),
+      child: Row(
+        children: [
+          IconButton(
+            visualDensity: VisualDensity.compact,
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            iconSize: 18,
+            icon: Icon(
+              data.collapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
+            ),
+            tooltip: data.collapsed ? 'Expand' : 'Collapse',
+            onPressed: () =>
+                state.rebuild(() => data.collapsed = !data.collapsed),
+          ),
+          Expanded(
+            child: MouseRegion(
+              cursor: SystemMouseCursors.move,
+              child: _DragSurface(
+                enabled: state._tool == _Tool.select,
+                onSelect: () => state._select(el),
+                onDelta: (d) => state._drag(el, d),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        _headerText,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelLarge,
+                      ),
+                    ),
+                    Icon(
+                      Icons.drag_indicator,
+                      size: 16,
+                      color: Theme.of(context).disabledColor,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    final body = TextField(
+      controller: el.textController,
+      focusNode: el.focus,
+      readOnly: !editing,
+      maxLines: null,
+      expands: true,
+      textAlignVertical: TextAlignVertical.top,
+      style: TextStyle(
+        fontSize: data.fontSize,
+        color: data.color != null ? Color(data.color!) : null,
+      ),
+      decoration: const InputDecoration(
+        isDense: true,
+        border: InputBorder.none,
+        hintText: 'Subnote…',
+        contentPadding: EdgeInsets.fromLTRB(8, 0, 8, 8),
+      ),
+      onChanged: (_) => state.rebuild(),
+    );
+
+    final card = Container(
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.9),
+        border: Border(left: BorderSide(color: scheme.primary, width: 3)),
+        borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          header,
+          if (!data.collapsed)
+            Expanded(
+              // Text tool: the body is live and edits. Otherwise it's inert and
+              // doubles as a drag surface, so the card moves from anywhere.
+              child: editing
+                  ? body
+                  : _DragSurface(
+                      enabled: state._tool == _Tool.select,
+                      onSelect: () => state._select(el),
+                      onDelta: (d) => state._drag(el, d),
+                      child: IgnorePointer(child: body),
+                    ),
+            ),
+        ],
+      ),
+    );
+
     return _Frame(
       selected: selected,
       onMove: (d) => state._drag(el, d),
       onResize: data.collapsed ? null : (d) => state._resize(el, d),
-      child: Container(
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.9),
-            border: Border(left: BorderSide(color: scheme.primary, width: 3)),
-            borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // The header doubles as the move handle: tap selects the note,
-              // dragging it moves the note, and the chevron toggles collapse.
-              MouseRegion(
-                cursor: SystemMouseCursors.move,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => state._select(el),
-                  onPanUpdate: state._tool == _Tool.select
-                      ? (d) => state._drag(el, d)
-                      : null,
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(2, 0, 6, 0),
-                    child: Row(
-                      children: [
-                        IconButton(
-                          visualDensity: VisualDensity.compact,
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-                          iconSize: 18,
-                          icon: Icon(
-                            data.collapsed
-                                ? Icons.chevron_right
-                                : Icons.keyboard_arrow_down,
-                          ),
-                          tooltip: data.collapsed ? 'Expand' : 'Collapse',
-                          onPressed: () =>
-                              state.rebuild(() => data.collapsed = !data.collapsed),
-                        ),
-                        Expanded(
-                          child: Text(
-                            _headerText,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.labelLarge,
-                          ),
-                        ),
-                        Icon(
-                          Icons.drag_indicator,
-                          size: 16,
-                          color: Theme.of(context).disabledColor,
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-              if (!data.collapsed)
-                Expanded(
-                  child: TextField(
-                    controller: el.textController,
-                    focusNode: el.focus,
-                    maxLines: null,
-                    expands: true,
-                    textAlignVertical: TextAlignVertical.top,
-                    style: TextStyle(
-                      fontSize: data.fontSize,
-                      color: data.color != null ? Color(data.color!) : null,
-                    ),
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      border: InputBorder.none,
-                      hintText: 'Subnote…',
-                      contentPadding: EdgeInsets.fromLTRB(8, 0, 8, 8),
-                    ),
-                    onChanged: (_) => state.rebuild(),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      );
+      child: card,
+    );
   }
 }
 
@@ -959,8 +1102,10 @@ class _Frame extends StatelessWidget {
 
   final bool selected;
   final Widget child;
-  final ValueChanged<DragUpdateDetails> onMove;
-  final ValueChanged<DragUpdateDetails>? onResize;
+
+  /// Screen-space drag deltas.
+  final ValueChanged<Offset> onMove;
+  final ValueChanged<Offset>? onResize;
 
   @override
   Widget build(BuildContext context) {
@@ -991,9 +1136,8 @@ class _Frame extends StatelessWidget {
           height: 14,
           child: MouseRegion(
             cursor: SystemMouseCursors.move,
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onPanUpdate: onMove,
+            child: _EagerDrag(
+              onDelta: onMove,
               child: Container(
                 color: primary,
                 alignment: Alignment.center,
@@ -1008,9 +1152,8 @@ class _Frame extends StatelessWidget {
             bottom: -6,
             child: MouseRegion(
               cursor: SystemMouseCursors.resizeDownRight,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanUpdate: onResize,
+              child: _EagerDrag(
+                onDelta: onResize!,
                 child: Container(
                   width: 16,
                   height: 16,

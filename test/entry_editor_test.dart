@@ -106,6 +106,10 @@ void main() {
       final field = find.widgetWithText(TextField, 'hello');
       expect(field, findsOneWidget);
 
+      // Editing happens under the text tool; select mode is for moving.
+      await tester.tap(find.byIcon(Icons.text_fields));
+      await tester.pump();
+
       await tester.tap(field);
       await tester.pump();
       // enterText only succeeds on an editable (non-readOnly, focusable) field.
@@ -113,6 +117,78 @@ void main() {
       await tester.pump();
 
       expect(find.text('hello world'), findsOneWidget);
+
+      await db.close();
+    });
+  });
+
+  testWidgets('in select mode a text box is moved by dragging its body', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime(2026, 7, 10);
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 200,
+            data: TextElementData(text: 'move me'),
+          ),
+          PlacedElement(
+            x: 30,
+            y: 260,
+            width: 200,
+            data: TextElementData(text: 'stay put'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      // Default tool is select; tapping selects (frame + resize handle appear).
+      await tester.tap(find.text('move me'));
+      await tester.pump();
+      expect(find.byIcon(Icons.open_in_full), findsOneWidget);
+
+      final before = tester.getTopLeft(find.text('move me'));
+      final otherBefore = tester.getTopLeft(find.text('stay put'));
+
+      await tester.drag(find.text('move me'), const Offset(50, 40));
+      await tester.pump();
+
+      final after = tester.getTopLeft(find.text('move me'));
+      final otherAfter = tester.getTopLeft(find.text('stay put'));
+
+      // The dragged box moved...
+      expect(after.dx, greaterThan(before.dx));
+      expect(after.dy, greaterThan(before.dy));
+      // ...and the canvas did NOT pan (the other box stayed put).
+      expect(otherAfter, otherBefore);
+
+      await db.close();
+    });
+  });
+
+  testWidgets('an empty text box is discarded when it loses focus', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      await _openEditor(tester, db, DateTime(2026, 7, 10));
+
+      // Text tool, then tap empty canvas to create a new (empty) box.
+      await tester.tap(find.byIcon(Icons.text_fields));
+      await tester.pump();
+      await tester.tapAt(const Offset(400, 450));
+      await tester.pump();
+      expect(find.text('Write…'), findsOneWidget);
+
+      // Switch tools (which drops focus). The untouched empty box is discarded.
+      await tester.tap(find.byIcon(Icons.pan_tool_alt_outlined));
+      await tester.pump();
+      expect(find.text('Write…'), findsNothing);
 
       await db.close();
     });
