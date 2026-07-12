@@ -625,20 +625,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     if (data is StrokeElementData) {
       return _positioned(
         el,
-        IgnorePointer(
-          ignoring: _tool == _Tool.draw,
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTap: () => _select(el),
-            onPanUpdate: _tool == _Tool.select ? (d) => _drag(el, d) : null,
-            child: CustomPaint(
-              size: Size(el.width ?? 0, el.height ?? 0),
-              painter: _StrokePainter(
-                data.points,
-                Color(data.color),
-                data.width,
-                selected: _selected == el,
-              ),
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => _select(el),
+          onPanUpdate: _tool == _Tool.select ? (d) => _drag(el, d) : null,
+          child: CustomPaint(
+            size: Size(el.width ?? 0, el.height ?? 0),
+            painter: _StrokePainter(
+              data.points,
+              Color(data.color),
+              data.width,
+              selected: _selected == el,
             ),
           ),
         ),
@@ -676,7 +673,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       top: el.y,
       width: el.width,
       height: height,
-      child: child,
+      // While drawing, elements don't intercept pointers so strokes can be laid
+      // over them freely.
+      child: IgnorePointer(ignoring: _tool == _Tool.draw, child: child),
     );
   }
 
@@ -859,28 +858,49 @@ class _SubnoteCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             mainAxisSize: MainAxisSize.min,
             children: [
-              InkWell(
-                onTap: () {
-                  state.rebuild(() => data.collapsed = !data.collapsed);
-                },
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                  child: Row(
-                    children: [
-                      Icon(
-                        data.collapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
-                        size: 18,
-                      ),
-                      const SizedBox(width: 2),
-                      Expanded(
-                        child: Text(
-                          _headerText,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.labelLarge,
+              // The header doubles as the move handle: tap selects the note,
+              // dragging it moves the note, and the chevron toggles collapse.
+              MouseRegion(
+                cursor: SystemMouseCursors.move,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => state._select(el),
+                  onPanUpdate: state._tool == _Tool.select
+                      ? (d) => state._drag(el, d)
+                      : null,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(2, 0, 6, 0),
+                    child: Row(
+                      children: [
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                          iconSize: 18,
+                          icon: Icon(
+                            data.collapsed
+                                ? Icons.chevron_right
+                                : Icons.keyboard_arrow_down,
+                          ),
+                          tooltip: data.collapsed ? 'Expand' : 'Collapse',
+                          onPressed: () =>
+                              state.rebuild(() => data.collapsed = !data.collapsed),
                         ),
-                      ),
-                    ],
+                        Expanded(
+                          child: Text(
+                            _headerText,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.labelLarge,
+                          ),
+                        ),
+                        Icon(
+                          Icons.drag_indicator,
+                          size: 16,
+                          color: Theme.of(context).disabledColor,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),

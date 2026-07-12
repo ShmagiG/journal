@@ -86,6 +86,39 @@ void main() {
     });
   });
 
+  testWidgets('a subnote can be dragged by its header to move it', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime(2026, 7, 10);
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 40,
+            y: 40,
+            width: 180,
+            height: 120,
+            data: SubnoteElementData(text: 'aside', collapsed: true),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      // Select tool is the default; the drag handle lives in the header.
+      final before = tester.getTopLeft(find.text('aside'));
+      await tester.drag(find.byIcon(Icons.drag_indicator), const Offset(60, 30));
+      await tester.pump();
+      final after = tester.getTopLeft(find.text('aside'));
+
+      expect(after.dx, greaterThan(before.dx));
+      expect(after.dy, greaterThan(before.dy));
+
+      await db.close();
+    });
+  });
+
   testWidgets('the draw tool exposes pen options', (tester) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
