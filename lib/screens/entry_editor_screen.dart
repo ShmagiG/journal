@@ -99,7 +99,15 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   /// Keeps the timestamp button from taking focus away from the editor it is
   /// meant to insert into.
-  final _timestampFocus = FocusNode(canRequestFocus: false, skipTraversal: true);
+  final _timestampFocus = FocusNode(
+    canRequestFocus: false,
+    skipTraversal: true,
+  );
+
+  /// Anchors keyboard focus inside the shortcut subtree. Focusing this (rather
+  /// than calling `unfocus()`) blurs whatever editor was active — discarding an
+  /// empty text box — while keeping the Ctrl+key bindings reachable.
+  final _canvasFocus = FocusNode(debugLabel: 'canvas');
 
   final List<_CanvasElement> _elements = [];
   bool _loading = true;
@@ -150,8 +158,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     });
   }
 
-  int get _topZ =>
-      _elements.isEmpty ? 0 : _elements.map((e) => e.z).reduce((a, b) => a > b ? a : b);
+  int get _topZ => _elements.isEmpty
+      ? 0
+      : _elements.map((e) => e.z).reduce((a, b) => a > b ? a : b);
 
   /// Canvas coordinate at the centre of the current viewport, for placing new
   /// elements somewhere visible.
@@ -251,6 +260,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   }
 
   void _addSubnote() {
+    if (_readOnly) return;
     final c = _visibleCenter();
     _add(
       SubnoteElementData.empty(),
@@ -310,7 +320,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     final origin = Offset(minX - pad, minY - pad);
     final rel = [for (final p in pts) p - origin];
     _add(
-      StrokeElementData(points: rel, color: _penColor.toARGB32(), width: _penWidth),
+      StrokeElementData(
+        points: rel,
+        color: _penColor.toARGB32(),
+        width: _penWidth,
+      ),
       x: origin.dx,
       y: origin.dy,
       width: maxX - minX + pad * 2,
@@ -329,7 +343,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
         // hits the box (not this background), so it edits instead of creating.
         _addTextAt(canvasPoint);
       case _Tool.select:
-        FocusScope.of(context).unfocus();
+        _canvasFocus.requestFocus();
         _select(null);
       case _Tool.draw:
         break;
@@ -375,7 +389,9 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
     c.value = TextEditingValue(
       text: '$before$insertion$after',
-      selection: TextSelection.collapsed(offset: before.length + insertion.length),
+      selection: TextSelection.collapsed(
+        offset: before.length + insertion.length,
+      ),
     );
     el.syncToData();
     setState(() {});
@@ -400,6 +416,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     _titleController.dispose();
     _transform.dispose();
     _timestampFocus.dispose();
+    _canvasFocus.dispose();
     for (final el in _elements) {
       el.dispose();
     }
@@ -415,35 +432,55 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       },
       child: CallbackShortcuts(
         bindings: {
-          const SingleActivator(LogicalKeyboardKey.keyT, control: true):
-              _insertTimestamp,
+          const SingleActivator(LogicalKeyboardKey.keyM, control: true): () =>
+              _setTool(_Tool.select),
+          const SingleActivator(LogicalKeyboardKey.keyT, control: true): () =>
+              _setTool(_Tool.text),
+          const SingleActivator(LogicalKeyboardKey.keyD, control: true): () =>
+              _setTool(_Tool.draw),
+          const SingleActivator(LogicalKeyboardKey.keyN, control: true):
+              _addSubnote,
+          // Ctrl+Shift+T, since Ctrl+T selects the text tool. SingleActivator
+          // matches modifiers exactly, so the two don't collide.
+          const SingleActivator(
+            LogicalKeyboardKey.keyT,
+            control: true,
+            shift: true,
+          ): _insertTimestamp,
         },
-        child: Scaffold(
-          appBar: AppBar(
-            title: Text(DateFormat.yMMMMEEEEd().format(widget.date)),
-          ),
-          body: _loading
-              ? const Center(child: CircularProgressIndicator())
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                      child: TextField(
-                        controller: _titleController,
-                        readOnly: _readOnly,
-                        style: Theme.of(context).textTheme.titleLarge,
-                        decoration: const InputDecoration(
-                          border: InputBorder.none,
-                          hintText: 'Title (optional)',
+        // Anchors focus inside the shortcut subtree so the bindings fire even
+        // when no editor is focused. Key events from a focused text box bubble
+        // up through here too.
+        child: Focus(
+          focusNode: _canvasFocus,
+          autofocus: true,
+          child: Scaffold(
+            appBar: AppBar(
+              title: Text(DateFormat.yMMMMEEEEd().format(widget.date)),
+            ),
+            body: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                        child: TextField(
+                          controller: _titleController,
+                          readOnly: _readOnly,
+                          style: Theme.of(context).textTheme.titleLarge,
+                          decoration: const InputDecoration(
+                            border: InputBorder.none,
+                            hintText: 'Title (optional)',
+                          ),
                         ),
                       ),
-                    ),
-                    _toolbar(context),
-                    const Divider(height: 1),
-                    Expanded(child: _canvas(context)),
-                  ],
-                ),
+                      _toolbar(context),
+                      const Divider(height: 1),
+                      Expanded(child: _canvas(context)),
+                    ],
+                  ),
+          ),
         ),
       ),
     );
@@ -487,13 +524,21 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
           padding: const EdgeInsets.symmetric(horizontal: 8),
           child: Row(
             children: [
-              _toolButton(Icons.pan_tool_alt_outlined, 'Select / move', _Tool.select),
-              _toolButton(Icons.text_fields, 'Add text (tap canvas)', _Tool.text),
-              _toolButton(Icons.edit, 'Draw', _Tool.draw),
+              _toolButton(
+                Icons.pan_tool_alt_outlined,
+                'Select / move (Ctrl+M)',
+                _Tool.select,
+              ),
+              _toolButton(
+                Icons.text_fields,
+                'Add text — tap canvas (Ctrl+T)',
+                _Tool.text,
+              ),
+              _toolButton(Icons.edit, 'Draw (Ctrl+D)', _Tool.draw),
               const SizedBox(width: 8),
               IconButton(
                 icon: const Icon(Icons.sticky_note_2_outlined),
-                tooltip: 'Add subnote',
+                tooltip: 'Add subnote (Ctrl+N)',
                 onPressed: _addSubnote,
               ),
               IconButton(
@@ -502,7 +547,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                 // discarded on blur).
                 focusNode: _timestampFocus,
                 icon: const Icon(Icons.schedule),
-                tooltip: 'Insert timestamp (Ctrl+T)',
+                tooltip: 'Insert timestamp (Ctrl+Shift+T)',
                 onPressed: _insertTimestamp,
               ),
               const Spacer(),
@@ -519,6 +564,15 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     );
   }
 
+  /// Switches the active tool (from a toolbar button or a Ctrl+key shortcut).
+  void _setTool(_Tool tool) {
+    if (_readOnly) return;
+    // Moving focus to the canvas discards any empty text box being left behind
+    // and makes text non-interactive in select/draw mode.
+    _canvasFocus.requestFocus();
+    setState(() => _tool = tool);
+  }
+
   Widget _toolButton(IconData icon, String tip, _Tool tool) {
     final active = _tool == tool;
     return IconButton(
@@ -526,12 +580,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       tooltip: tip,
       isSelected: active,
       color: active ? Theme.of(context).colorScheme.primary : null,
-      onPressed: () {
-        // Dropping focus first discards any empty text box being left behind and
-        // makes text non-interactive in select/draw mode.
-        FocusScope.of(context).unfocus();
-        setState(() => _tool = tool);
-      },
+      onPressed: () => _setTool(tool),
     );
   }
 
@@ -649,7 +698,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
           ),
           const VerticalDivider(width: 8),
           for (final c in _palette)
-            _swatch(c, colorValue == c.toARGB32(), () => setColor(c.toARGB32())),
+            _swatch(
+              c,
+              colorValue == c.toARGB32(),
+              () => setColor(c.toARGB32()),
+            ),
           const VerticalDivider(width: 8),
           IconButton(
             icon: const Icon(Icons.flip_to_front),
@@ -916,7 +969,9 @@ class _CanvasBackground extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return CustomPaint(
-      painter: _GridPainter(Theme.of(context).dividerColor.withValues(alpha: 0.4)),
+      painter: _GridPainter(
+        Theme.of(context).dividerColor.withValues(alpha: 0.4),
+      ),
     );
   }
 }
@@ -960,7 +1015,11 @@ class _StrokePainter extends CustomPainter {
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
     if (points.length == 1) {
-      canvas.drawPoints(PointMode.points, points, paint..strokeCap = StrokeCap.round);
+      canvas.drawPoints(
+        PointMode.points,
+        points,
+        paint..strokeCap = StrokeCap.round,
+      );
     } else {
       final path = Path()..moveTo(points.first.dx, points.first.dy);
       for (var i = 1; i < points.length; i++) {
@@ -1057,7 +1116,11 @@ class _TextBox extends StatelessWidget {
 /// A floating, collapsible subnote card. The header (tap to collapse/expand) is
 /// always shown; the body is an editable text area when expanded.
 class _SubnoteCard extends StatelessWidget {
-  const _SubnoteCard({required this.state, required this.el, required this.data});
+  const _SubnoteCard({
+    required this.state,
+    required this.el,
+    required this.data,
+  });
 
   final _EntryEditorScreenState state;
   final _CanvasElement el;
@@ -1234,7 +1297,11 @@ class _Frame extends StatelessWidget {
               child: Container(
                 color: primary,
                 alignment: Alignment.center,
-                child: const Icon(Icons.drag_indicator, size: 12, color: Colors.white),
+                child: const Icon(
+                  Icons.drag_indicator,
+                  size: 12,
+                  color: Colors.white,
+                ),
               ),
             ),
           ),
@@ -1254,7 +1321,11 @@ class _Frame extends StatelessWidget {
                     color: primary,
                     shape: BoxShape.circle,
                   ),
-                  child: const Icon(Icons.open_in_full, size: 10, color: Colors.white),
+                  child: const Icon(
+                    Icons.open_in_full,
+                    size: 10,
+                    color: Colors.white,
+                  ),
                 ),
               ),
             ),

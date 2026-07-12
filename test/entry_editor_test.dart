@@ -1,5 +1,6 @@
 import 'package:drift/native.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:journal/data/database.dart';
@@ -8,6 +9,20 @@ import 'package:journal/screens/entry_editor_screen.dart';
 
 Widget _host(AppDatabase db, DateTime day) =>
     MaterialApp(home: EntryEditorScreen(database: db, date: day));
+
+/// Presses Ctrl(+Shift)+[key].
+Future<void> _pressCtrl(
+  WidgetTester tester,
+  LogicalKeyboardKey key, {
+  bool shift = false,
+}) async {
+  await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+  if (shift) await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+  await tester.sendKeyEvent(key);
+  if (shift) await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+  await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+  await tester.pump();
+}
 
 /// Pumps the editor and lets its async `_load()` settle past the spinner.
 Future<void> _openEditor(WidgetTester tester, AppDatabase db, DateTime day) async {
@@ -254,6 +269,69 @@ void main() {
 
       await tester.tap(find.byIcon(Icons.schedule));
       await tester.pump();
+
+      expect(
+        find.textContaining(RegExp(r'note\n\d{2}:\d{2}:\d{2}\n')),
+        findsOneWidget,
+      );
+
+      await db.close();
+    });
+  });
+
+  testWidgets('Ctrl+D / Ctrl+T / Ctrl+M switch tools and Ctrl+N adds a subnote',
+      (tester) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      await _openEditor(tester, db, DateTime.now());
+
+      // Ctrl+D → draw tool (pen options appear).
+      await _pressCtrl(tester, LogicalKeyboardKey.keyD);
+      expect(find.byType(Slider), findsOneWidget);
+
+      // Ctrl+M → select tool (pen options gone).
+      await _pressCtrl(tester, LogicalKeyboardKey.keyM);
+      expect(find.byType(Slider), findsNothing);
+
+      // Ctrl+T → text tool: tapping empty canvas now creates a text box.
+      await _pressCtrl(tester, LogicalKeyboardKey.keyT);
+      await tester.tapAt(const Offset(400, 450));
+      await tester.pump();
+      expect(find.text('Write…'), findsOneWidget);
+
+      // Ctrl+N → adds a subnote (its header appears).
+      await _pressCtrl(tester, LogicalKeyboardKey.keyN);
+      expect(find.text('Subnote'), findsOneWidget);
+
+      await db.close();
+    });
+  });
+
+  testWidgets('Ctrl+Shift+T inserts a timestamp without switching tools', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 220,
+            data: TextElementData(text: 'note'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      // Focus the box under the text tool (Ctrl+T), then stamp with Ctrl+Shift+T.
+      await _pressCtrl(tester, LogicalKeyboardKey.keyT);
+      await tester.tap(find.widgetWithText(TextField, 'note'));
+      await tester.pump();
+
+      await _pressCtrl(tester, LogicalKeyboardKey.keyT, shift: true);
 
       expect(
         find.textContaining(RegExp(r'note\n\d{2}:\d{2}:\d{2}\n')),
