@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ui' show PointMode;
 
 import 'package:flutter/gestures.dart';
@@ -12,9 +13,28 @@ import '../models/elements.dart';
 /// canvas: move/select existing elements, drop new text, or draw freehand.
 enum _Tool { select, text, draw }
 
-/// Logical size of the (large, fixed) canvas. Big enough to feel edgeless when
-/// panned/zoomed; true infinite virtualization is future work.
-const double _canvasSize = 5000;
+/// How far the canvas surface reaches from the origin in *each* direction, so
+/// canvas coordinates run from -[_canvasExtent] to +[_canvasExtent] on both
+/// axes and there is room to pan left/up as well as right/down. Big enough to
+/// feel edgeless when panned/zoomed; true infinite virtualization is future
+/// work.
+const double _canvasExtent = 5000;
+
+/// Logical size of the (large, fixed) canvas surface.
+const double _canvasSize = _canvasExtent * 2;
+
+/// Where canvas coordinate (0, 0) sits within the surface. Element placements
+/// and stroke points are stored in canvas coordinates (which may be negative);
+/// adding this offset converts them to surface coordinates for layout/painting,
+/// and subtracting it converts a pointer's local position back.
+const Offset _canvasOrigin = Offset(_canvasExtent, _canvasExtent);
+
+/// The view that shows canvas (0, 0) in the top-left of the viewport — where the
+/// canvas starts out, and what "Reset view" returns to. Content written before
+/// the canvas grew leftwards/upwards lives at positive coordinates, so this
+/// keeps it exactly where it has always been.
+Matrix4 _homeTransform() => Matrix4.identity()
+  ..translateByDouble(-_canvasOrigin.dx, -_canvasOrigin.dy, 0, 1);
 
 /// Colors offered for text and pen. First entry doubles as the default.
 const List<Color> _palette = [
@@ -93,9 +113,10 @@ class EntryEditorScreen extends StatefulWidget {
   State<EntryEditorScreen> createState() => _EntryEditorScreenState();
 }
 
-class _EntryEditorScreenState extends State<EntryEditorScreen> {
+class _EntryEditorScreenState extends State<EntryEditorScreen>
+    with WidgetsBindingObserver {
   final _titleController = TextEditingController();
-  final _transform = TransformationController();
+  final _transform = TransformationController(_homeTransform());
 
   /// Keeps the timestamp button from taking focus away from the editor it is
   /// meant to insert into.
@@ -124,16 +145,45 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   Color _penColor = _palette[0];
   double _penWidth = StrokeElementData.defaultWidth;
 
+  /// Pen opacity, baked into a stroke's colour when it is committed. Kept above
+  /// [_minOpacity] so a stroke can never be drawn completely invisible.
+  double _penOpacity = 1;
+
+  static const double _minOpacity = 0.1;
+
   // The stroke currently being drawn, in canvas coordinates (null when idle).
   List<Offset>? _drawing;
 
   Size _viewport = Size.zero;
 
+  /// Set by every edit and cleared by [_save], so the autosave below only writes
+  /// when there is something to write.
+  bool _dirty = false;
+  Timer? _autosave;
+
+  /// How long an edit can sit unsaved. Closing the window (or killing the app)
+  /// doesn't reliably give us time to finish a write, so the entry is saved as
+  /// we go rather than only on the way out.
+  static const _autosaveInterval = Duration(seconds: 3);
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _autosave = Timer.periodic(_autosaveInterval, (_) {
+      if (_dirty) _save();
+    });
     _load();
   }
+
+  /// Leaving the app (backgrounded on mobile, window closing on desktop) flushes
+  /// whatever hasn't been autosaved yet.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed && _dirty) _save();
+  }
+
+  void _markDirty() => _dirty = true;
 
   Future<void> _load() async {
     final entry = await widget.database.entryForDate(widget.date);
@@ -170,7 +220,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   /// elements somewhere visible.
   Offset _visibleCenter() {
     final screenCenter = Offset(_viewport.width / 2, _viewport.height / 2);
-    return _transform.toScene(screenCenter);
+    return _transform.toScene(screenCenter) - _canvasOrigin;
   }
 
   /// Only today's entry can be changed — past days are a read-only record.
@@ -228,6 +278,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   void _removeElement(_CanvasElement el) {
     if (!_elements.contains(el)) return;
+    _markDirty();
     setState(() {
       _elements.remove(el);
       if (_selected == el) _selected = null;
@@ -237,8 +288,10 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   }
 
   /// Public rebuild hook for child element widgets (they can't call the
-  /// protected [setState] directly).
+  /// protected [setState] directly). Anything routed through here is an edit —
+  /// typing, recolouring, collapsing — so it also arms the autosave.
   void rebuild([VoidCallback? mutate]) {
+    _markDirty();
     setState(() => mutate?.call());
   }
 
@@ -259,6 +312,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       z: _topZ + 1,
     );
     _attachFocus(el);
+    _markDirty();
     setState(() {
       _elements.add(el);
       _selected = el;
@@ -299,6 +353,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   void _deleteSelected() {
     final el = _selected;
     if (el == null) return;
+    _markDirty();
     setState(() {
       _elements.remove(el);
       _selected = null;
@@ -310,6 +365,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   void _bringToFront() {
     final el = _selected;
     if (el == null) return;
+    _markDirty();
     setState(() => el.z = _topZ + 1);
   }
 
@@ -317,12 +373,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   void _onPointerDown(PointerDownEvent e) {
     if (_tool != _Tool.draw) return;
-    setState(() => _drawing = [e.localPosition]);
+    setState(() => _drawing = [e.localPosition - _canvasOrigin]);
   }
 
   void _onPointerMove(PointerMoveEvent e) {
     if (_tool != _Tool.draw || _drawing == null) return;
-    setState(() => _drawing!.add(e.localPosition));
+    setState(() => _drawing!.add(e.localPosition - _canvasOrigin));
   }
 
   void _onPointerUp(PointerUpEvent e) {
@@ -347,7 +403,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     _add(
       StrokeElementData(
         points: rel,
-        color: _penColor.toARGB32(),
+        color: _penColor.withValues(alpha: _penOpacity).toARGB32(),
         width: _penWidth,
       ),
       x: origin.dx,
@@ -419,13 +475,14 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       ),
     );
     el.syncToData();
-    setState(() {});
+    rebuild();
   }
 
   // --- Save ----------------------------------------------------------------
 
   Future<void> _save() async {
     if (_loading || _readOnly) return;
+    _dirty = false;
     for (final el in _elements) {
       el.syncToData();
     }
@@ -438,6 +495,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
 
   @override
   void dispose() {
+    _autosave?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _titleController.dispose();
     _transform.dispose();
     _timestampFocus.dispose();
@@ -493,6 +552,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                         child: TextField(
                           controller: _titleController,
                           readOnly: _readOnly,
+                          onChanged: (_) => _markDirty(),
                           style: Theme.of(context).textTheme.titleLarge,
                           decoration: const InputDecoration(
                             border: InputBorder.none,
@@ -535,7 +595,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
             IconButton(
               icon: const Icon(Icons.center_focus_strong),
               tooltip: 'Reset view',
-              onPressed: () => _transform.value = Matrix4.identity(),
+              onPressed: () => _transform.value = _homeTransform(),
             ),
           ],
         ),
@@ -579,7 +639,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
               IconButton(
                 icon: const Icon(Icons.center_focus_strong),
                 tooltip: 'Reset view',
-                onPressed: () => _transform.value = Matrix4.identity(),
+                onPressed: () => _transform.value = _homeTransform(),
               ),
             ],
           ),
@@ -620,7 +680,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       return _formatOptions(context, el);
     }
     if (el != null && el.data is StrokeElementData) {
-      return _strokeOptions(context);
+      return _strokeOptions(context, el);
     }
     return const SizedBox(height: 4);
   }
@@ -643,12 +703,26 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
               onChanged: (v) => setState(() => _penWidth = v),
             ),
           ),
+          const Icon(Icons.opacity, size: 18),
+          Expanded(
+            child: Slider(
+              min: _minOpacity,
+              max: 1,
+              value: _penOpacity,
+              label: '${(_penOpacity * 100).round()}%',
+              divisions: 9,
+              onChanged: (v) => setState(() => _penOpacity = v),
+            ),
+          ),
+          const SizedBox(width: 8),
         ],
       ),
     );
   }
 
-  Widget _strokeOptions(BuildContext context) {
+  Widget _strokeOptions(BuildContext context, _CanvasElement el) {
+    final data = el.data as StrokeElementData;
+    final color = Color(data.color);
     return SizedBox(
       height: 44,
       child: Row(
@@ -659,7 +733,21 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
             tooltip: 'Bring to front',
             onPressed: _bringToFront,
           ),
-          const Spacer(),
+          const Icon(Icons.opacity, size: 18),
+          Expanded(
+            child: Slider(
+              min: _minOpacity,
+              max: 1,
+              value: color.a.clamp(_minOpacity, 1.0),
+              label: '${(color.a * 100).round()}%',
+              divisions: 9,
+              // Transparency lives in the stroke's colour, so re-tinting it in
+              // place is all it takes to make an existing line see-through.
+              onChanged: (v) => rebuild(
+                () => data.color = color.withValues(alpha: v).toARGB32(),
+              ),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.delete_outline),
             tooltip: 'Delete',
@@ -798,7 +886,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTapUp: (d) => _onCanvasTap(d.localPosition),
+                        onTapUp: (d) =>
+                            _onCanvasTap(d.localPosition - _canvasOrigin),
                         child: const _CanvasBackground(),
                       ),
                     ),
@@ -806,11 +895,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
                     if (_drawing != null && _drawing!.isNotEmpty)
                       Positioned.fill(
                         child: IgnorePointer(
-                          child: CustomPaint(
-                            painter: _StrokePainter(
-                              _drawing!,
-                              _penColor,
-                              _penWidth,
+                          // The in-progress points are canvas coordinates, so the
+                          // preview paints from the origin, not the surface's
+                          // top-left corner.
+                          child: Transform.translate(
+                            offset: _canvasOrigin,
+                            child: CustomPaint(
+                              painter: _StrokePainter(
+                                _drawing!,
+                                _penColor.withValues(alpha: _penOpacity),
+                                _penWidth,
+                              ),
                             ),
                           ),
                         ),
@@ -893,8 +988,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     final bar = _selected == el ? _Frame.barHeight : 0.0;
     return Positioned(
       key: ValueKey(el.key),
-      left: el.x,
-      top: el.y - bar,
+      left: el.x + _canvasOrigin.dx,
+      top: el.y + _canvasOrigin.dy - bar,
       width: el.width,
       height: height == null ? null : height + bar,
       // While drawing, elements don't intercept pointers so strokes can be laid
@@ -909,6 +1004,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   /// [delta] is a screen-space drag delta; dividing by [_scale] converts it to
   /// canvas pixels.
   void _drag(_CanvasElement el, Offset delta) {
+    _markDirty();
     setState(() {
       el.x += delta.dx / _scale;
       el.y += delta.dy / _scale;
@@ -916,6 +1012,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   }
 
   void _resize(_CanvasElement el, Offset delta) {
+    _markDirty();
     setState(() {
       el.width = ((el.width ?? 120) + delta.dx / _scale).clamp(60.0, 2000.0);
       // Text boxes grow only horizontally; their height follows their content.

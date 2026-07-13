@@ -300,7 +300,7 @@ void main() {
 
         // Ctrl+D → draw tool (pen options appear).
         await _pressCtrl(tester, LogicalKeyboardKey.keyD);
-        expect(find.byType(Slider), findsOneWidget);
+        expect(find.byType(Slider), findsNWidgets(2)); // width + opacity
 
         // Ctrl+M → select tool (pen options gone).
         await _pressCtrl(tester, LogicalKeyboardKey.keyM);
@@ -441,10 +441,10 @@ void main() {
       final db = AppDatabase(NativeDatabase.memory());
       await _openEditor(tester, db, DateTime.now());
 
-      // Switch to the draw tool; a pen width slider should appear.
+      // Switch to the draw tool; the pen width and opacity sliders appear.
       await tester.tap(find.byIcon(Icons.edit));
       await tester.pump();
-      expect(find.byType(Slider), findsOneWidget);
+      expect(find.byType(Slider), findsNWidgets(2));
 
       await db.close();
     });
@@ -509,4 +509,148 @@ void main() {
       await db.close();
     });
   });
+
+  testWidgets('the canvas can be panned left and up from the initial view', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 200,
+            data: TextElementData(text: 'anchor'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      final before = tester.getTopLeft(find.text('anchor'));
+
+      // Dragging the empty canvas down-right pans towards negative coordinates,
+      // which only works if the surface extends above and left of the origin.
+      await tester.dragFrom(const Offset(600, 500), const Offset(120, 90));
+      await tester.pump();
+
+      final after = tester.getTopLeft(find.text('anchor'));
+      expect(after.dx, greaterThan(before.dx));
+      expect(after.dy, greaterThan(before.dy));
+
+      await db.close();
+    });
+  });
+
+  testWidgets('edits are autosaved without leaving the screen', (tester) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 220,
+            data: TextElementData(text: 'draft'),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      final field = find.widgetWithText(TextField, 'draft');
+      await tester.tap(field);
+      await tester.pump();
+      await tester.enterText(field, 'saved without going back');
+      await tester.pump();
+
+      // No pop, no back button: the autosave timer alone must persist this.
+      await Future<void>.delayed(const Duration(seconds: 4));
+      await tester.pump();
+
+      final texts = await _storedTexts(db, day);
+      expect(texts, contains('saved without going back'));
+
+      await db.close();
+    });
+  });
+
+  testWidgets('the opacity slider makes a selected stroke translucent', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          // A text box at the origin, purely to locate canvas (0, 0) on screen.
+          PlacedElement(
+            x: 0,
+            y: 0,
+            width: 100,
+            data: TextElementData(text: 'origin'),
+          ),
+          PlacedElement(
+            x: 40,
+            y: 140,
+            width: 120,
+            height: 120,
+            data: StrokeElementData(
+              points: const [Offset(0, 0), Offset(120, 120)],
+              color: 0xFF000000, // fully opaque
+              width: 3,
+            ),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      final origin = tester.getTopLeft(
+        find.widgetWithText(TextField, 'origin'),
+      );
+
+      // Select the stroke: its options bar carries the opacity slider.
+      await tester.tapAt(origin + const Offset(100, 200));
+      await tester.pump();
+      final slider = find.byType(Slider);
+      expect(slider, findsOneWidget);
+
+      // Drag the thumb to the far left (minimum opacity).
+      await tester.drag(slider, const Offset(-500, 0));
+      await tester.pump();
+
+      await Future<void>.delayed(const Duration(seconds: 4));
+      await tester.pump();
+
+      final strokes = await _storedStrokes(db, day);
+      expect(strokes, hasLength(1));
+      expect(Color(strokes.single.color).a, lessThan(1.0));
+
+      await db.close();
+    });
+  });
 }
+
+Future<List<ElementData>> _storedElements(AppDatabase db, DateTime day) async {
+  final entry = await db.entryForDate(day);
+  if (entry == null) return const [];
+  final rows = await db.elementsForEntry(entry.id);
+  return [for (final r in rows) ElementData.decode(r.type, r.data)];
+}
+
+Future<List<String>> _storedTexts(AppDatabase db, DateTime day) async => [
+  for (final d in await _storedElements(db, day))
+    if (d is TextElementData) d.text,
+];
+
+Future<List<StrokeElementData>> _storedStrokes(
+  AppDatabase db,
+  DateTime day,
+) async => [
+  for (final d in await _storedElements(db, day))
+    if (d is StrokeElementData) d,
+];
