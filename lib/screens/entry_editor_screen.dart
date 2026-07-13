@@ -116,6 +116,10 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   _Tool _tool = _Tool.select;
   _CanvasElement? _selected;
 
+  /// The element explicitly opened for editing — by tapping into its text, or by
+  /// creating a subnote — independent of the current tool. Cleared on blur.
+  _CanvasElement? _editing;
+
   // Pen settings for the draw tool.
   Color _penColor = _palette[0];
   double _penWidth = StrokeElementData.defaultWidth;
@@ -176,12 +180,27 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   /// Whether elements can currently be moved/resized/selected.
   bool get _moveEnabled => !_readOnly && _tool == _Tool.select;
 
-  /// Whether text/subnote editors are live (text tool, and not read-only).
-  bool get _textEditing => !_readOnly && _tool == _Tool.text;
+  /// Whether [el]'s editor is live: the text tool makes every box editable, and
+  /// a single box can also be opened on its own via [_beginEditing].
+  bool _isEditing(_CanvasElement el) =>
+      !_readOnly && (_tool == _Tool.text || identical(_editing, el));
 
   void _select(_CanvasElement? el) {
     if (_readOnly) return;
     setState(() => _selected = el);
+  }
+
+  /// Opens [el]'s editor and puts the caret in it, whatever the current tool.
+  void _beginEditing(_CanvasElement el) {
+    if (_readOnly || el.focus == null) return;
+    setState(() {
+      _editing = el;
+      _selected = el;
+    });
+    // The field only stops being read-only once this rebuild lands.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) el.focus?.requestFocus();
+    });
   }
 
   /// Selecting a text/subnote follows keyboard focus: when a box's editor gains
@@ -198,6 +217,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
       if (f.hasFocus) {
         if (_selected != el) setState(() => _selected = el);
       } else {
+        if (identical(_editing, el)) setState(() => _editing = null);
         el.syncToData();
         if (el.data is TextElementData && el.data.isEmpty) {
           _removeElement(el);
@@ -211,6 +231,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     setState(() {
       _elements.remove(el);
       if (_selected == el) _selected = null;
+      if (identical(_editing, el)) _editing = null;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
   }
@@ -262,14 +283,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
   void _addSubnote() {
     if (_readOnly) return;
     final c = _visibleCenter();
-    _add(
+    final el = _add(
       SubnoteElementData.empty(),
       x: c.dx - SubnoteElementData.defaultWidth / 2,
       y: c.dy - SubnoteElementData.defaultHeight / 2,
       width: SubnoteElementData.defaultWidth,
       height: SubnoteElementData.defaultHeight,
     );
-    setState(() => _tool = _Tool.select);
+    // The draw tool puts every element behind an IgnorePointer, so leave it —
+    // otherwise keep the current tool and just open the new card for typing.
+    if (_tool == _Tool.draw) setState(() => _tool = _Tool.select);
+    _beginEditing(el);
   }
 
   void _deleteSelected() {
@@ -278,6 +302,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     setState(() {
       _elements.remove(el);
       _selected = null;
+      if (identical(_editing, el)) _editing = null;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
   }
@@ -800,8 +825,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     );
   }
 
+  /// Strokes always sit beneath text and subnotes. A stroke's hit area is its
+  /// whole bounding box, so a stroke drawn *around* a text box (circling it, say)
+  /// would otherwise cover it and swallow every click meant for the text.
+  static int _layer(_CanvasElement el) => el.data is StrokeElementData ? 0 : 1;
+
   List<_CanvasElement> _sortedByZ() {
-    final list = [..._elements]..sort((a, b) => a.z.compareTo(b.z));
+    final list = [..._elements]
+      ..sort((a, b) {
+        final byLayer = _layer(a).compareTo(_layer(b));
+        return byLayer != 0 ? byLayer : a.z.compareTo(b.z);
+      });
     return list;
   }
 
@@ -852,12 +886,17 @@ class _EntryEditorScreenState extends State<EntryEditorScreen> {
     } else if (data is SubnoteElementData && data.collapsed) {
       height = null;
     }
+    // A selected element grows upwards to make room for the frame's move bar.
+    // Reserving the space here (rather than letting the bar overflow the box) is
+    // what makes the bar hit-testable: a render box never hit-tests outside its
+    // own bounds, however it paints.
+    final bar = _selected == el ? _Frame.barHeight : 0.0;
     return Positioned(
       key: ValueKey(el.key),
       left: el.x,
-      top: el.y,
+      top: el.y - bar,
       width: el.width,
-      height: height,
+      height: height == null ? null : height + bar,
       // While drawing, elements don't intercept pointers so strokes can be laid
       // over them freely.
       child: IgnorePointer(ignoring: _tool == _Tool.draw, child: child),
@@ -902,13 +941,29 @@ class _EagerPanRecognizer extends PanGestureRecognizer {
 
 /// Drags [child] using an [_EagerPanRecognizer], reporting screen-space deltas.
 /// Because the gesture is claimed on pointer-down, nothing inside [child] can
-/// receive taps — keep buttons outside it.
-class _EagerDrag extends StatelessWidget {
-  const _EagerDrag({required this.onDelta, required this.child, this.onDown});
+/// receive taps — keep buttons outside it. [onTap] stands in for the tap the
+/// recognizer swallows: it fires when the pointer is released having travelled
+/// less than the touch slop.
+class _EagerDrag extends StatefulWidget {
+  const _EagerDrag({
+    required this.onDelta,
+    required this.child,
+    this.onDown,
+    this.onTap,
+  });
 
   final ValueChanged<Offset> onDelta;
   final VoidCallback? onDown;
+  final VoidCallback? onTap;
   final Widget child;
+
+  @override
+  State<_EagerDrag> createState() => _EagerDragState();
+}
+
+class _EagerDragState extends State<_EagerDrag> {
+  /// Distance travelled since pointer-down, to tell a tap from a drag.
+  double _travel = 0;
 
   @override
   Widget build(BuildContext context) {
@@ -919,29 +974,40 @@ class _EagerDrag extends StatelessWidget {
             GestureRecognizerFactoryWithHandlers<_EagerPanRecognizer>(
               _EagerPanRecognizer.new,
               (r) {
-                r.onDown = (_) => onDown?.call();
-                r.onUpdate = (d) => onDelta(d.delta);
+                r.onDown = (_) {
+                  _travel = 0;
+                  widget.onDown?.call();
+                };
+                r.onUpdate = (d) {
+                  _travel += d.delta.distance;
+                  widget.onDelta(d.delta);
+                };
+                r.onEnd = (_) {
+                  if (_travel < kTouchSlop) widget.onTap?.call();
+                };
               },
             ),
       },
-      child: child,
+      child: widget.child,
     );
   }
 }
 
 /// A surface that selects its element on pointer-down and moves it on drag.
 /// When [enabled] is false (text/draw tool) it only handles taps, leaving drags
-/// to the canvas.
+/// to the canvas. [onTap] (if given) fires on a click that didn't drag.
 class _DragSurface extends StatelessWidget {
   const _DragSurface({
     required this.enabled,
     required this.onSelect,
     required this.onDelta,
     required this.child,
+    this.onTap,
   });
 
   final bool enabled;
   final VoidCallback onSelect;
+  final VoidCallback? onTap;
 
   /// Screen-space drag delta.
   final ValueChanged<Offset> onDelta;
@@ -952,13 +1018,18 @@ class _DragSurface extends StatelessWidget {
     if (!enabled) {
       return GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTap: onSelect,
+        onTap: onTap ?? onSelect,
         child: child,
       );
     }
     // Pointer-down selects: a click without movement still selects, since the
     // eager pan swallows the tap gesture.
-    return _EagerDrag(onDown: onSelect, onDelta: onDelta, child: child);
+    return _EagerDrag(
+      onDown: onSelect,
+      onDelta: onDelta,
+      onTap: onTap,
+      child: child,
+    );
   }
 }
 
@@ -1058,7 +1129,7 @@ class _TextBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final selected = state._selected == el;
-    final editing = state._textEditing;
+    final editing = state._isEditing(el);
     final style = TextStyle(
       fontSize: data.fontSize,
       color: data.color != null ? Color(data.color!) : null,
@@ -1091,7 +1162,7 @@ class _TextBox extends StatelessWidget {
       );
     }
     // Otherwise the field is inert and a transparent overlay on top of it is the
-    // drag surface: pointer-down selects, a drag moves.
+    // drag surface: pointer-down selects, a drag moves, a click opens the editor.
     return _Frame(
       selected: selected,
       onMove: (d) => state._drag(el, d),
@@ -1104,6 +1175,7 @@ class _TextBox extends StatelessWidget {
               enabled: state._moveEnabled,
               onSelect: () => state._select(el),
               onDelta: (d) => state._drag(el, d),
+              onTap: () => state._beginEditing(el),
               child: const SizedBox.expand(),
             ),
           ),
@@ -1137,7 +1209,7 @@ class _SubnoteCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final selected = state._selected == el;
-    final editing = state._textEditing;
+    final editing = state._isEditing(el);
 
     // The chevron stays OUTSIDE the drag surface: the eager pan recognizer
     // claims the gesture on pointer-down, so anything inside the surface can no
@@ -1222,14 +1294,16 @@ class _SubnoteCard extends StatelessWidget {
           header,
           if (!data.collapsed)
             Expanded(
-              // Text tool: the body is live and edits. Otherwise it's inert and
-              // doubles as a drag surface, so the card moves from anywhere.
+              // While editing, the body is live and takes text. Otherwise it's
+              // inert and doubles as a drag surface, so the card moves from
+              // anywhere — and a click (not a drag) opens the editor.
               child: editing
                   ? body
                   : _DragSurface(
                       enabled: state._moveEnabled,
                       onSelect: () => state._select(el),
                       onDelta: (d) => state._drag(el, d),
+                      onTap: () => state._beginEditing(el),
                       child: IgnorePointer(child: body),
                     ),
             ),
@@ -1248,6 +1322,11 @@ class _SubnoteCard extends StatelessWidget {
 
 /// Wraps a selected element with a highlight frame, a top move bar, and a
 /// bottom-right resize handle. When not selected it just shows [child].
+///
+/// The move bar occupies [barHeight] at the top of the frame; the caller
+/// ([_EntryEditorScreenState._positioned]) grows the element upwards by the same
+/// amount when it is selected, so the content stays where it was and the bar
+/// stays inside the frame's bounds — a render box never hit-tests outside them.
 class _Frame extends StatelessWidget {
   const _Frame({
     required this.selected,
@@ -1255,6 +1334,8 @@ class _Frame extends StatelessWidget {
     required this.onMove,
     this.onResize,
   });
+
+  static const double barHeight = 14;
 
   final bool selected;
   final Widget child;
@@ -1277,19 +1358,22 @@ class _Frame extends StatelessWidget {
     return Stack(
       clipBehavior: Clip.none,
       children: [
-        Container(
-          decoration: BoxDecoration(
-            border: Border.all(color: primary, width: 1.5),
-            borderRadius: BorderRadius.circular(4),
+        Padding(
+          padding: const EdgeInsets.only(top: barHeight),
+          child: Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: primary, width: 1.5),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: child,
           ),
-          child: child,
         ),
-        // Move bar along the top edge.
+        // Move bar along the top edge, in the space reserved for it.
         Positioned(
           left: 0,
           right: 0,
-          top: -14,
-          height: 14,
+          top: 0,
+          height: barHeight,
           child: MouseRegion(
             cursor: SystemMouseCursors.move,
             child: _EagerDrag(

@@ -7,8 +7,9 @@ import 'package:journal/data/database.dart';
 import 'package:journal/models/elements.dart';
 import 'package:journal/screens/entry_editor_screen.dart';
 
-Widget _host(AppDatabase db, DateTime day) =>
-    MaterialApp(home: EntryEditorScreen(database: db, date: day));
+Widget _host(AppDatabase db, DateTime day) => MaterialApp(
+  home: EntryEditorScreen(database: db, date: day),
+);
 
 /// Presses Ctrl(+Shift)+[key].
 Future<void> _pressCtrl(
@@ -25,14 +26,20 @@ Future<void> _pressCtrl(
 }
 
 /// Pumps the editor and lets its async `_load()` settle past the spinner.
-Future<void> _openEditor(WidgetTester tester, AppDatabase db, DateTime day) async {
+Future<void> _openEditor(
+  WidgetTester tester,
+  AppDatabase db,
+  DateTime day,
+) async {
   await tester.pumpWidget(_host(db, day));
   await Future<void>.delayed(const Duration(milliseconds: 100));
   await tester.pump();
 }
 
 void main() {
-  testWidgets('renders a seeded text box and a collapsed subnote', (tester) async {
+  testWidgets('renders a seeded text box and a collapsed subnote', (
+    tester,
+  ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
       final day = DateTime.now();
@@ -121,10 +128,8 @@ void main() {
       final field = find.widgetWithText(TextField, 'hello');
       expect(field, findsOneWidget);
 
-      // Editing happens under the text tool; select mode is for moving.
-      await tester.tap(find.byIcon(Icons.text_fields));
-      await tester.pump();
-
+      // A click inside the box opens its editor, even in the default select tool
+      // (dragging it, rather than clicking, still moves it).
       await tester.tap(field);
       await tester.pump();
       // enterText only succeeds on an editable (non-readOnly, focusable) field.
@@ -137,7 +142,7 @@ void main() {
     });
   });
 
-  testWidgets('in select mode a text box is moved by dragging its body', (
+  testWidgets('a text box is moved by dragging the move bar of its frame', (
     tester,
   ) async {
     await tester.runAsync(() async {
@@ -162,7 +167,7 @@ void main() {
       );
       await _openEditor(tester, db, day);
 
-      // Default tool is select; tapping selects (frame + resize handle appear).
+      // Clicking the box selects it (frame with move bar + resize handle).
       await tester.tap(find.text('move me'));
       await tester.pump();
       expect(find.byIcon(Icons.open_in_full), findsOneWidget);
@@ -170,7 +175,11 @@ void main() {
       final before = tester.getTopLeft(find.text('move me'));
       final otherBefore = tester.getTopLeft(find.text('stay put'));
 
-      await tester.drag(find.text('move me'), const Offset(50, 40));
+      // The move bar above the selected box drags it around.
+      await tester.drag(
+        find.byIcon(Icons.drag_indicator),
+        const Offset(50, 40),
+      );
       await tester.pump();
 
       final after = tester.getTopLeft(find.text('move me'));
@@ -231,7 +240,10 @@ void main() {
 
       // Select tool is the default; the drag handle lives in the header.
       final before = tester.getTopLeft(find.text('aside'));
-      await tester.drag(find.byIcon(Icons.drag_indicator), const Offset(60, 30));
+      await tester.drag(
+        find.byIcon(Icons.drag_indicator),
+        const Offset(60, 30),
+      );
       await tester.pump();
       final after = tester.getTopLeft(find.text('aside'));
 
@@ -279,29 +291,69 @@ void main() {
     });
   });
 
-  testWidgets('Ctrl+D / Ctrl+T / Ctrl+M switch tools and Ctrl+N adds a subnote',
-      (tester) async {
+  testWidgets(
+    'Ctrl+D / Ctrl+T / Ctrl+M switch tools and Ctrl+N adds a subnote',
+    (tester) async {
+      await tester.runAsync(() async {
+        final db = AppDatabase(NativeDatabase.memory());
+        await _openEditor(tester, db, DateTime.now());
+
+        // Ctrl+D → draw tool (pen options appear).
+        await _pressCtrl(tester, LogicalKeyboardKey.keyD);
+        expect(find.byType(Slider), findsOneWidget);
+
+        // Ctrl+M → select tool (pen options gone).
+        await _pressCtrl(tester, LogicalKeyboardKey.keyM);
+        expect(find.byType(Slider), findsNothing);
+
+        // Ctrl+T → text tool: tapping empty canvas now creates a text box.
+        await _pressCtrl(tester, LogicalKeyboardKey.keyT);
+        await tester.tapAt(const Offset(400, 450));
+        await tester.pump();
+        expect(find.text('Write…'), findsOneWidget);
+
+        // Ctrl+N → adds a subnote (its header appears).
+        await _pressCtrl(tester, LogicalKeyboardKey.keyN);
+        expect(find.text('Subnote'), findsOneWidget);
+
+        await db.close();
+      });
+    },
+  );
+
+  testWidgets('a newly added subnote is focused and can be typed into', (
+    tester,
+  ) async {
     await tester.runAsync(() async {
       final db = AppDatabase(NativeDatabase.memory());
       await _openEditor(tester, db, DateTime.now());
 
-      // Ctrl+D → draw tool (pen options appear).
-      await _pressCtrl(tester, LogicalKeyboardKey.keyD);
-      expect(find.byType(Slider), findsOneWidget);
-
-      // Ctrl+M → select tool (pen options gone).
-      await _pressCtrl(tester, LogicalKeyboardKey.keyM);
-      expect(find.byType(Slider), findsNothing);
-
-      // Ctrl+T → text tool: tapping empty canvas now creates a text box.
-      await _pressCtrl(tester, LogicalKeyboardKey.keyT);
-      await tester.tapAt(const Offset(400, 450));
+      // The select tool is active; adding a subnote must still leave it editable.
+      await tester.tap(find.byIcon(Icons.sticky_note_2_outlined));
       await tester.pump();
-      expect(find.text('Write…'), findsOneWidget);
 
-      // Ctrl+N → adds a subnote (its header appears).
-      await _pressCtrl(tester, LogicalKeyboardKey.keyN);
-      expect(find.text('Subnote'), findsOneWidget);
+      final body = find.widgetWithText(TextField, 'Subnote…');
+      expect(body, findsOneWidget);
+
+      // enterText only succeeds on an editable (non-readOnly, focusable) field.
+      await tester.enterText(body, 'typed right away');
+      await tester.pump();
+
+      expect(find.text('typed right away'), findsWidgets);
+
+      // Tapping empty canvas closes the editor; clicking the body reopens it.
+      await tester.tapAt(const Offset(600, 500));
+      await tester.pump();
+      await tester.tap(find.widgetWithText(TextField, 'typed right away'));
+      await tester.pump();
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'typed right away'),
+        'edited again',
+      );
+      await tester.pump();
+
+      expect(find.text('edited again'), findsWidgets);
 
       await db.close();
     });
@@ -393,6 +445,66 @@ void main() {
       await tester.tap(find.byIcon(Icons.edit));
       await tester.pump();
       expect(find.byType(Slider), findsOneWidget);
+
+      await db.close();
+    });
+  });
+
+  testWidgets('a stroke over a text box does not swallow the box\'s clicks', (
+    tester,
+  ) async {
+    await tester.runAsync(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      final day = DateTime.now();
+      await db.saveEntry(
+        day,
+        elements: [
+          PlacedElement(
+            x: 30,
+            y: 30,
+            width: 200,
+            z: 0,
+            data: TextElementData(text: 'under the ink'),
+          ),
+          // A stroke circling the text: drawn later (higher z) and hit-tested by
+          // its whole bounding box, which encloses the text box.
+          PlacedElement(
+            x: 20,
+            y: 20,
+            width: 240,
+            height: 120,
+            z: 1,
+            data: StrokeElementData(
+              points: const [
+                Offset(0, 0),
+                Offset(240, 0),
+                Offset(240, 120),
+                Offset(0, 120),
+                Offset(0, 0),
+              ],
+              color: 0xFF000000,
+              width: 3,
+            ),
+          ),
+        ],
+      );
+      await _openEditor(tester, db, day);
+
+      // Clicking the text reaches the text, not the stroke drawn over it.
+      final field = find.widgetWithText(TextField, 'under the ink');
+      final centre = tester.getCenter(field);
+      await tester.tap(field);
+      await tester.pump();
+      await tester.enterText(field, 'still editable');
+      await tester.pump();
+
+      expect(find.text('still editable'), findsOneWidget);
+
+      // The stroke is still selectable below the text box, where the two don't
+      // overlap (selecting it reveals the options bar with "bring to front").
+      await tester.tapAt(centre + const Offset(0, 60));
+      await tester.pump();
+      expect(find.byIcon(Icons.flip_to_front), findsOneWidget);
 
       await db.close();
     });
