@@ -172,6 +172,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   @override
   void initState() {
     super.initState();
+    _readOnly =
+        AppDatabase.dateOnly(widget.date) != AppDatabase.dateOnly(DateTime.now());
     WidgetsBinding.instance.addObserver(this);
     _autosave = Timer.periodic(_autosaveInterval, (_) {
       if (_dirty) _save();
@@ -227,8 +229,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   }
 
   /// Only today's entry can be changed — past days are a read-only record.
-  bool get _readOnly =>
-      AppDatabase.dateOnly(widget.date) != AppDatabase.dateOnly(DateTime.now());
+  /// Captured once at open (see [initState]) rather than recomputed from
+  /// `DateTime.now()`: if the editor is left open across midnight the session
+  /// keeps the editability it started with, so an in-progress entry keeps
+  /// autosaving to its (fixed) [EntryEditorScreen.date] instead of silently
+  /// going read-only and dropping edits.
+  late final bool _readOnly;
 
   /// Whether elements can currently be moved/resized/selected.
   bool get _moveEnabled => !_readOnly && _tool == _Tool.select;
@@ -733,11 +739,6 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
       child: Row(
         children: [
           const SizedBox(width: 8),
-          IconButton(
-            icon: const Icon(Icons.flip_to_front),
-            tooltip: 'Bring to front',
-            onPressed: _bringToFront,
-          ),
           const Icon(Icons.opacity, size: 18),
           Expanded(
             child: Slider(
@@ -864,9 +865,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   // --- Canvas --------------------------------------------------------------
 
   Widget _canvas(BuildContext context) {
-    // Pan/zoom via InteractiveViewer, except in draw mode where a single-finger
-    // drag must paint instead of pan.
-    final interactive = _tool != _Tool.draw;
+    // Draw mode disables one-finger *pan* so a drag paints instead of moving the
+    // canvas, but zoom (pinch / mouse-wheel / ctrl+scroll) stays enabled — those
+    // go through InteractiveViewer's scale path, while drawing is captured by the
+    // child Listener independent of the gesture arena.
+    final allowPan = _tool != _Tool.draw;
     return LayoutBuilder(
       builder: (context, constraints) {
         _viewport = Size(constraints.maxWidth, constraints.maxHeight);
@@ -876,8 +879,8 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
             constrained: false,
             minScale: 0.3,
             maxScale: 5,
-            panEnabled: interactive,
-            scaleEnabled: interactive,
+            panEnabled: allowPan,
+            scaleEnabled: true,
             child: SizedBox(
               width: _canvasSize,
               height: _canvasSize,
