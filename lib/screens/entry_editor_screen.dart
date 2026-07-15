@@ -115,6 +115,10 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
               _controller.setTool(Tool.text),
           const SingleActivator(LogicalKeyboardKey.keyD, control: true): () =>
               _controller.setTool(Tool.draw),
+          const SingleActivator(LogicalKeyboardKey.keyB, control: true): () =>
+              _controller.setTool(Tool.marquee),
+          const SingleActivator(LogicalKeyboardKey.keyL, control: true): () =>
+              _controller.setTool(Tool.lasso),
           const SingleActivator(LogicalKeyboardKey.keyN, control: true): () =>
               _controller.addSubnote(at: _visibleCenter()),
           // Ctrl+Shift+T, since Ctrl+T selects the text tool. SingleActivator
@@ -219,6 +223,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                 Tool.text,
               ),
               _toolButton(Icons.edit, 'Draw (Ctrl+D)', Tool.draw),
+              _toolButton(
+                Icons.highlight_alt,
+                'Box select (Ctrl+B)',
+                Tool.marquee,
+              ),
+              _toolButton(Icons.gesture, 'Lasso select (Ctrl+L)', Tool.lasso),
               const SizedBox(width: 8),
               IconButton(
                 icon: const Icon(Icons.sticky_note_2_outlined),
@@ -259,11 +269,15 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
-  /// Second toolbar row: pen options when drawing, or format/actions when an
-  /// element is selected. Empty otherwise.
+  /// Second toolbar row: pen options when drawing, group actions when several
+  /// elements are selected, or format/actions for a single selected element.
+  /// Empty otherwise.
   Widget _contextRow(BuildContext context) {
     if (_controller.tool == Tool.draw) {
       return _penOptions(context);
+    }
+    if (_controller.selection.length > 1) {
+      return _multiOptions(context);
     }
     final el = _controller.selected;
     if (el != null && el.data is! StrokeElementData) {
@@ -273,6 +287,34 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
       return _strokeOptions(context, el);
     }
     return const SizedBox(height: 4);
+  }
+
+  /// Actions available when a multi-selection is active: the two operations that
+  /// apply uniformly to any mix of elements.
+  Widget _multiOptions(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          const SizedBox(width: 12),
+          Text(
+            '${_controller.selection.length} selected',
+            style: Theme.of(context).textTheme.labelLarge,
+          ),
+          const Spacer(),
+          IconButton(
+            icon: const Icon(Icons.flip_to_front),
+            tooltip: 'Bring to front',
+            onPressed: _controller.bringToFront,
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete',
+            onPressed: _controller.deleteSelected,
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _penOptions(BuildContext context) {
@@ -448,11 +490,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   // --- Canvas --------------------------------------------------------------
 
   Widget _canvas(BuildContext context) {
-    // Draw mode disables one-finger *pan* so a drag paints instead of moving the
-    // canvas, but zoom (pinch / mouse-wheel / ctrl+scroll) stays enabled — those
-    // go through InteractiveViewer's scale path, while drawing is captured by the
-    // child Listener independent of the gesture arena.
-    final allowPan = _controller.tool != Tool.draw;
+    // The draw / marquee / lasso tools disable one-finger *pan* so a drag paints
+    // or sweeps out a selection instead of moving the canvas, but zoom (pinch /
+    // mouse-wheel / ctrl+scroll) stays enabled — those go through
+    // InteractiveViewer's scale path, while the drag is captured by the child
+    // Listener independent of the gesture arena.
+    final allowPan = !_controller.capturesPointer;
     return LayoutBuilder(
       builder: (context, constraints) {
         _viewport = Size(constraints.maxWidth, constraints.maxHeight);
@@ -517,6 +560,22 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                           ),
                         ),
                       ),
+                    // Live marquee box, isolated like the draw preview above.
+                    if (_controller.tool == Tool.marquee)
+                      _overlay(
+                        MarqueePainter(
+                          rect: _controller.marquee,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      ),
+                    // Live lasso path, isolated like the draw preview above.
+                    if (_controller.tool == Tool.lasso)
+                      _overlay(
+                        LassoPainter(
+                          points: _controller.lasso,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                      ),
                   ],
                 ),
               ),
@@ -527,6 +586,20 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
+  /// A full-surface, non-interactive [CustomPaint] layer whose painter works in
+  /// canvas coordinates (translated off the surface origin) and repaints in
+  /// isolation. Shared by the marquee and lasso previews.
+  Widget _overlay(CustomPainter painter) {
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: Transform.translate(
+          offset: canvasOrigin,
+          child: RepaintBoundary(child: CustomPaint(painter: painter)),
+        ),
+      ),
+    );
+  }
+
   Widget _buildElement(BuildContext context, CanvasElement el) {
     final data = el.data;
     if (data is StrokeElementData) {
@@ -534,7 +607,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
         el,
         DragSurface(
           enabled: _controller.moveEnabled,
-          onSelect: () => _controller.select(el),
+          onSelect: () => _controller.selectAt(el),
           onDelta: (d) => _controller.drag(el, d),
           child: CustomPaint(
             size: Size(el.width ?? 0, el.height ?? 0),
@@ -542,7 +615,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
               data.points,
               Color(data.color),
               data.width,
-              selected: _controller.selected == el,
+              selected: _controller.isSelected(el),
             ),
           ),
         ),
@@ -583,18 +656,21 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     // A selected element grows upwards to make room for the frame's move bar.
     // Reserving the space here (rather than letting the bar overflow the box) is
     // what makes the bar hit-testable: a render box never hit-tests outside its
-    // own bounds, however it paints.
-    final bar = _controller.selected == el ? Frame.barHeight : 0.0;
+    // own bounds, however it paints. Strokes have no frame/move bar, so they get
+    // no offset — a selected stroke stays exactly where it was drawn.
+    final hasFrame = data is! StrokeElementData;
+    final bar = (hasFrame && _controller.isSelected(el)) ? Frame.barHeight : 0.0;
     return Positioned(
       key: ValueKey(el.key),
       left: el.x + canvasOrigin.dx,
       top: el.y + canvasOrigin.dy - bar,
       width: el.width,
       height: height == null ? null : height + bar,
-      // While drawing, elements don't intercept pointers so strokes can be laid
-      // over them freely.
+      // While drawing or sweeping a selection, elements don't intercept pointers
+      // so the drag reaches the surface Listener (strokes can be laid over them
+      // freely, and a marquee/lasso can start on top of an element).
       child: IgnorePointer(
-        ignoring: _controller.tool == Tool.draw,
+        ignoring: _controller.capturesPointer,
         child: child,
       ),
     );

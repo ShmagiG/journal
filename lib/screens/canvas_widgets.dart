@@ -216,6 +216,77 @@ class LiveStrokePainter extends CustomPainter {
       old.color != color || old.width != width;
 }
 
+/// Paints the in-progress marquee (box) selection rectangle. Listens to [rect]
+/// so only this layer repaints as the box is dragged.
+class MarqueePainter extends CustomPainter {
+  MarqueePainter({required this.rect, required this.color})
+    : super(repaint: rect);
+
+  final ValueListenable<Rect?> rect;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final r = rect.value;
+    if (r == null) return;
+    canvas.drawRect(
+      r,
+      Paint()
+        ..color = color.withValues(alpha: 0.12)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawRect(
+      r,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant MarqueePainter old) => old.color != color;
+}
+
+/// Paints the in-progress lasso selection path, closed back to its start so it
+/// reads as the region being enclosed. Listens to [points] so only this layer
+/// repaints per point.
+class LassoPainter extends CustomPainter {
+  LassoPainter({required this.points, required this.color})
+    : super(repaint: points);
+
+  final ValueListenable<List<Offset>?> points;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pts = points.value;
+    if (pts == null || pts.length < 2) return;
+    final path = Path()..moveTo(pts.first.dx, pts.first.dy);
+    for (var i = 1; i < pts.length; i++) {
+      path.lineTo(pts[i].dx, pts[i].dy);
+    }
+    path.close();
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color.withValues(alpha: 0.1)
+        ..style = PaintingStyle.fill,
+    );
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant LassoPainter old) => old.color != color;
+}
+
 /// Draws a freehand stroke (a dot for a single point, a joined path otherwise)
 /// from [points] in the canvas's local space. Shared by the committed-stroke
 /// [StrokePainter] and the live [LiveStrokePainter].
@@ -290,7 +361,7 @@ class TextBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final selected = controller.selected == el;
+    final selected = controller.isSelected(el);
     final editing = controller.isEditing(el);
     final style = TextStyle(
       fontSize: data.fontSize,
@@ -335,9 +406,9 @@ class TextBox extends StatelessWidget {
           Positioned.fill(
             child: DragSurface(
               enabled: controller.moveEnabled,
-              onSelect: () => controller.select(el),
+              onSelect: () => controller.selectAt(el),
               onDelta: (d) => controller.drag(el, d),
-              onTap: () => controller.beginEditing(el),
+              onTap: () => controller.onElementTap(el),
               child: const SizedBox.expand(),
             ),
           ),
@@ -371,7 +442,7 @@ class SubnoteCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final selected = controller.selected == el;
+    final selected = controller.isSelected(el);
     final editing = controller.isEditing(el);
 
     // The chevron stays OUTSIDE the drag surface: the eager pan recognizer
@@ -398,7 +469,7 @@ class SubnoteCard extends StatelessWidget {
               cursor: SystemMouseCursors.move,
               child: DragSurface(
                 enabled: controller.moveEnabled,
-                onSelect: () => controller.select(el),
+                onSelect: () => controller.selectAt(el),
                 onDelta: (d) => controller.drag(el, d),
                 child: Row(
                   children: [
@@ -464,9 +535,9 @@ class SubnoteCard extends StatelessWidget {
                   ? body
                   : DragSurface(
                       enabled: controller.moveEnabled,
-                      onSelect: () => controller.select(el),
+                      onSelect: () => controller.selectAt(el),
                       onDelta: (d) => controller.drag(el, d),
-                      onTap: () => controller.beginEditing(el),
+                      onTap: () => controller.onElementTap(el),
                       child: IgnorePointer(child: body),
                     ),
             ),

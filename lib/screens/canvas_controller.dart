@@ -1,14 +1,17 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../data/database.dart';
 import '../models/elements.dart';
 
 /// The active canvas tool. Selecting one changes what a pointer does on the
-/// canvas: move/select existing elements, drop new text, or draw freehand.
-enum Tool { select, text, draw }
+/// canvas: move/select existing elements, drop new text, draw freehand, or pick
+/// several elements at once by dragging a box ([marquee]) or drawing a shape
+/// around them ([lasso]).
+enum Tool { select, text, draw, marquee, lasso }
 
 /// How far the canvas surface reaches from the origin in *each* direction, so
 /// canvas coordinates run from -[canvasExtent] to +[canvasExtent] on both axes
@@ -167,8 +170,17 @@ class CanvasController extends ChangeNotifier {
   Tool _tool = Tool.select;
   Tool get tool => _tool;
 
-  CanvasElement? _selected;
-  CanvasElement? get selected => _selected;
+  /// The set of currently-selected elements. Multiple can be selected at once
+  /// via Ctrl+click, a marquee box, or a lasso; a plain click selects one.
+  final Set<CanvasElement> _selection = {};
+  Set<CanvasElement> get selection => _selection;
+
+  bool isSelected(CanvasElement el) => _selection.contains(el);
+
+  /// The sole selected element, or null when zero or many are selected. The
+  /// format toolbar keys off this, since per-element formatting only makes sense
+  /// for a single target.
+  CanvasElement? get selected => _selection.length == 1 ? _selection.first : null;
 
   /// The element explicitly opened for editing — by tapping into its text, or by
   /// creating a subnote — independent of the current tool. Cleared on blur.
@@ -190,6 +202,17 @@ class CanvasController extends ChangeNotifier {
   /// A [ValueNotifier] (not notify-the-whole-tree) so that adding a point
   /// repaints only the isolated live-stroke layer, never the whole element list.
   final ValueNotifier<List<Offset>?> liveStroke = ValueNotifier(null);
+
+  /// The marquee rectangle being dragged (marquee tool), in canvas coordinates,
+  /// or null when idle. Isolated in its own layer like [liveStroke].
+  final ValueNotifier<Rect?> marquee = ValueNotifier(null);
+
+  /// The lasso path being drawn (lasso tool), in canvas coordinates, or null
+  /// when idle. Isolated in its own layer like [liveStroke].
+  final ValueNotifier<List<Offset>?> lasso = ValueNotifier(null);
+
+  /// Anchor corner of the in-progress marquee, in canvas coordinates.
+  Offset? _marqueeStart;
 
   /// Set by every edit and cleared by [save], so the autosave below only writes
   /// when there is something to write.
@@ -253,6 +276,13 @@ class CanvasController extends ChangeNotifier {
   /// Whether elements can currently be moved/resized/selected.
   bool get moveEnabled => !readOnly && _tool == Tool.select;
 
+  /// Whether the current tool captures raw pointer drags on the canvas surface
+  /// (drawing a stroke, dragging a marquee box, or drawing a lasso) instead of
+  /// moving elements or panning. In these tools elements don't intercept
+  /// pointers and one-finger pan is disabled so the drag reaches the surface.
+  bool get capturesPointer =>
+      _tool == Tool.draw || _tool == Tool.marquee || _tool == Tool.lasso;
+
   /// Whether [el]'s editor is live: the text tool makes every box editable, and
   /// a single box can also be opened on its own via [beginEditing].
   bool isEditing(CanvasElement el) =>
@@ -308,17 +338,50 @@ class CanvasController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Makes [el] the sole selection (clearing any others); null clears all.
   void select(CanvasElement? el) {
     if (readOnly) return;
-    _selected = el;
+    _selection.clear();
+    if (el != null) _selection.add(el);
     notifyListeners();
+  }
+
+  /// Adds [el] to the selection if absent, otherwise removes it. Backs Ctrl+click.
+  void toggleSelected(CanvasElement el) {
+    if (readOnly) return;
+    if (!_selection.remove(el)) _selection.add(el);
+    notifyListeners();
+  }
+
+  /// Selection from a pointer landing on [el]. Ctrl toggles it in the current
+  /// multi-selection; otherwise, an element that's already part of a selection
+  /// is left as-is (so a following drag moves the whole group) and any other
+  /// element replaces the selection.
+  void selectAt(CanvasElement el) {
+    if (readOnly) return;
+    if (HardwareKeyboard.instance.isControlPressed) {
+      toggleSelected(el);
+    } else if (!_selection.contains(el)) {
+      select(el);
+    }
+  }
+
+  /// A click (not a drag) that landed on [el] and released without moving. A
+  /// plain click opens the editor; a Ctrl+click is a multi-select toggle (already
+  /// applied on pointer-down by [selectAt]), so it must *not* also open the
+  /// editor — doing so would collapse the selection back to this one element.
+  void onElementTap(CanvasElement el) {
+    if (HardwareKeyboard.instance.isControlPressed) return;
+    beginEditing(el);
   }
 
   /// Opens [el]'s editor and puts the caret in it, whatever the current tool.
   void beginEditing(CanvasElement el) {
     if (readOnly || el.focus == null) return;
     _editing = el;
-    _selected = el;
+    _selection
+      ..clear()
+      ..add(el);
     notifyListeners();
     // The field only stops being read-only once this rebuild lands.
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -338,8 +401,12 @@ class CanvasController extends ChangeNotifier {
       // field somehow takes focus.
       if (readOnly) return;
       if (f.hasFocus) {
-        if (_selected != el) {
-          _selected = el;
+        // Typing into a box makes it the single selection, so the format
+        // toolbar and frame track what's being edited.
+        if (!(_selection.length == 1 && _selection.contains(el))) {
+          _selection
+            ..clear()
+            ..add(el);
           notifyListeners();
         }
       } else {
@@ -359,7 +426,7 @@ class CanvasController extends ChangeNotifier {
     if (!_elements.contains(el)) return;
     _dirty = true;
     _elements.remove(el);
-    if (_selected == el) _selected = null;
+    _selection.remove(el);
     if (identical(_editing, el)) _editing = null;
     notifyListeners();
     WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
@@ -384,7 +451,9 @@ class CanvasController extends ChangeNotifier {
     _attachFocus(el);
     _dirty = true;
     _elements.add(el);
-    _selected = el;
+    _selection
+      ..clear()
+      ..add(el);
     notifyListeners();
     return el;
   }
@@ -424,21 +493,30 @@ class CanvasController extends ChangeNotifier {
   }
 
   void deleteSelected() {
-    final el = _selected;
-    if (el == null) return;
+    if (_selection.isEmpty) return;
     _dirty = true;
-    _elements.remove(el);
-    _selected = null;
-    if (identical(_editing, el)) _editing = null;
+    final removed = List.of(_selection);
+    _elements.removeWhere(_selection.contains);
+    if (_editing != null && _selection.contains(_editing)) _editing = null;
+    _selection.clear();
     notifyListeners();
-    WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      for (final el in removed) {
+        el.dispose();
+      }
+    });
   }
 
   void bringToFront() {
-    final el = _selected;
-    if (el == null) return;
+    if (_selection.isEmpty) return;
     _dirty = true;
-    el.z = _topZ + 1;
+    // Lift the whole selection above everything else, keeping the selected
+    // elements' relative order among themselves.
+    final ordered = _selection.toList()..sort((a, b) => a.z.compareTo(b.z));
+    var z = _topZ;
+    for (final el in ordered) {
+      el.z = ++z;
+    }
     notifyListeners();
   }
 
@@ -462,32 +540,91 @@ class CanvasController extends ChangeNotifier {
         addTextAt(canvasPoint);
       case Tool.select:
         requestCanvasFocus();
-        select(null);
+        // Clicking empty canvas clears the selection, unless Ctrl is held (so a
+        // stray click mid-multi-select doesn't wipe the group).
+        if (!HardwareKeyboard.instance.isControlPressed) select(null);
       case Tool.draw:
+      case Tool.marquee:
+      case Tool.lasso:
         break;
     }
   }
 
-  // --- Drawing (draw tool) -------------------------------------------------
+  // --- Surface pointer drags (draw / marquee / lasso) ----------------------
 
+  /// A canvas-surface drag starts. Which live layer it feeds depends on the
+  /// tool; none of them notify the whole tree — each isolated layer listens to
+  /// its own notifier so only that layer repaints per point.
   void onPointerDown(PointerDownEvent e) {
-    if (_tool != Tool.draw) return;
-    // No notify: only the live-stroke layer (which listens to liveStroke) needs
-    // to repaint, not the element list.
-    liveStroke.value = [e.localPosition - canvasOrigin];
+    final p = e.localPosition - canvasOrigin;
+    switch (_tool) {
+      case Tool.draw:
+        liveStroke.value = [p];
+      case Tool.marquee:
+        _marqueeStart = p;
+        marquee.value = Rect.fromPoints(p, p);
+      case Tool.lasso:
+        lasso.value = [p];
+      case Tool.select:
+      case Tool.text:
+        break;
+    }
   }
 
   void onPointerMove(PointerMoveEvent e) {
-    if (_tool != Tool.draw || liveStroke.value == null) return;
-    // Reassign a new list so the notifier fires; the live-stroke CustomPaint
-    // repaints in isolation.
-    liveStroke.value = [...liveStroke.value!, e.localPosition - canvasOrigin];
+    final p = e.localPosition - canvasOrigin;
+    switch (_tool) {
+      case Tool.draw:
+        if (liveStroke.value == null) return;
+        // Reassign a new list so the notifier fires.
+        liveStroke.value = [...liveStroke.value!, p];
+      case Tool.marquee:
+        if (_marqueeStart == null) return;
+        marquee.value = Rect.fromPoints(_marqueeStart!, p);
+      case Tool.lasso:
+        if (lasso.value == null) return;
+        lasso.value = [...lasso.value!, p];
+      case Tool.select:
+      case Tool.text:
+        break;
+    }
   }
 
   void onPointerUp(PointerUpEvent e) {
-    if (_tool != Tool.draw || liveStroke.value == null) return;
-    final pts = liveStroke.value!;
-    liveStroke.value = null;
+    switch (_tool) {
+      case Tool.draw:
+        final pts = liveStroke.value;
+        liveStroke.value = null;
+        if (pts != null) _commitStroke(pts);
+      case Tool.marquee:
+        final r = marquee.value;
+        marquee.value = null;
+        _marqueeStart = null;
+        if (r != null) _selectInRect(r);
+        _finishAreaSelect();
+      case Tool.lasso:
+        final pts = lasso.value;
+        lasso.value = null;
+        if (pts != null) _selectInLasso(pts);
+        _finishAreaSelect();
+      case Tool.select:
+      case Tool.text:
+        break;
+    }
+  }
+
+  /// Once a marquee/lasso sweep completes, drop back into the select tool so the
+  /// freshly-selected elements can be moved right away — unless Ctrl is held, in
+  /// which case the user is chaining additive sweeps and stays in the tool.
+  void _finishAreaSelect() {
+    if (_tool != Tool.select &&
+        !HardwareKeyboard.instance.isControlPressed) {
+      _tool = Tool.select;
+      notifyListeners();
+    }
+  }
+
+  void _commitStroke(List<Offset> pts) {
     if (pts.isEmpty) return;
     final pad = _penWidth / 2 + 1;
     var minX = pts.first.dx, minY = pts.first.dy;
@@ -512,7 +649,62 @@ class CanvasController extends ChangeNotifier {
       height: maxY - minY + pad * 2,
     );
     // A stroke shouldn't leave the element "selected"; keep drawing fluidly.
-    _selected = null;
+    _selection.clear();
+    notifyListeners();
+  }
+
+  // --- Area / lasso selection ----------------------------------------------
+
+  /// An element's rectangle in canvas coordinates, for hit-testing selections.
+  /// Text boxes have no stored height (they auto-size to their content), so a
+  /// line-count estimate stands in — selection tolerance is forgiving.
+  Rect boundsOf(CanvasElement el) {
+    final w = el.width ?? 120;
+    final h = el.height ?? _estimatedHeight(el);
+    return Rect.fromLTWH(el.x, el.y, w, h);
+  }
+
+  static double _estimatedHeight(CanvasElement el) {
+    final d = el.data;
+    if (d is TextElementData) {
+      final lines = d.text.isEmpty ? 1 : '\n'.allMatches(d.text).length + 1;
+      return lines * d.fontSize * 1.4 + 16;
+    }
+    return 80;
+  }
+
+  /// Even–odd ray cast: whether [p] falls inside the polygon [poly].
+  static bool _pointInPolygon(Offset p, List<Offset> poly) {
+    var inside = false;
+    for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      final a = poly[i], b = poly[j];
+      if (((a.dy > p.dy) != (b.dy > p.dy)) &&
+          (p.dx < (b.dx - a.dx) * (p.dy - a.dy) / (b.dy - a.dy) + a.dx)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  /// Selects every element whose bounds intersect [r] (the marquee box). Ctrl
+  /// adds to the current selection instead of replacing it.
+  void _selectInRect(Rect r) {
+    if (!HardwareKeyboard.instance.isControlPressed) _selection.clear();
+    for (final el in _elements) {
+      if (r.overlaps(boundsOf(el))) _selection.add(el);
+    }
+    notifyListeners();
+  }
+
+  /// Selects every element whose centre falls inside the lasso path. Ctrl adds
+  /// to the current selection instead of replacing it.
+  void _selectInLasso(List<Offset> path) {
+    if (!HardwareKeyboard.instance.isControlPressed) _selection.clear();
+    if (path.length >= 3) {
+      for (final el in _elements) {
+        if (_pointInPolygon(boundsOf(el).center, path)) _selection.add(el);
+      }
+    }
     notifyListeners();
   }
 
@@ -553,12 +745,18 @@ class CanvasController extends ChangeNotifier {
   // --- Move / resize -------------------------------------------------------
 
   /// [delta] is a screen-space drag delta; dividing by the current [scale]
-  /// converts it to canvas pixels.
+  /// converts it to canvas pixels. Dragging one member of a multi-selection
+  /// moves the whole group together.
   void drag(CanvasElement el, Offset delta) {
     _dirty = true;
     final s = scale();
-    el.x += delta.dx / s;
-    el.y += delta.dy / s;
+    final dx = delta.dx / s;
+    final dy = delta.dy / s;
+    final targets = _selection.contains(el) ? _selection : {el};
+    for (final t in targets) {
+      t.x += dx;
+      t.y += dy;
+    }
     notifyListeners();
   }
 
@@ -614,6 +812,8 @@ class CanvasController extends ChangeNotifier {
     _disposed = true;
     _autosave?.cancel();
     liveStroke.dispose();
+    marquee.dispose();
+    lasso.dispose();
     for (final el in _elements) {
       el.dispose();
     }
