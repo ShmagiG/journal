@@ -1,118 +1,20 @@
-import 'dart:async';
-import 'dart:ui' show PointMode;
-
-import 'package:flutter/foundation.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 
 import '../data/database.dart';
 import '../models/elements.dart';
-
-/// The active canvas tool. Selecting one changes what a pointer does on the
-/// canvas: move/select existing elements, drop new text, or draw freehand.
-enum _Tool { select, text, draw }
-
-/// How far the canvas surface reaches from the origin in *each* direction, so
-/// canvas coordinates run from -[_canvasExtent] to +[_canvasExtent] on both
-/// axes and there is room to pan left/up as well as right/down. Big enough to
-/// feel edgeless when panned/zoomed; true infinite virtualization is future
-/// work.
-const double _canvasExtent = 5000;
-
-/// Logical size of the (large, fixed) canvas surface.
-const double _canvasSize = _canvasExtent * 2;
-
-/// Where canvas coordinate (0, 0) sits within the surface. Element placements
-/// and stroke points are stored in canvas coordinates (which may be negative);
-/// adding this offset converts them to surface coordinates for layout/painting,
-/// and subtracting it converts a pointer's local position back.
-const Offset _canvasOrigin = Offset(_canvasExtent, _canvasExtent);
-
-/// The view that shows canvas (0, 0) in the top-left of the viewport — where the
-/// canvas starts out, and what "Reset view" returns to. Content written before
-/// the canvas grew leftwards/upwards lives at positive coordinates, so this
-/// keeps it exactly where it has always been.
-Matrix4 _homeTransform() => Matrix4.identity()
-  ..translateByDouble(-_canvasOrigin.dx, -_canvasOrigin.dy, 0, 1);
-
-/// Colors offered for text and pen. First entry doubles as the default.
-const List<Color> _palette = [
-  Colors.black,
-  Color(0xFFD32F2F), // red
-  Color(0xFF1976D2), // blue
-  Color(0xFF388E3C), // green
-  Color(0xFFF57C00), // orange
-  Color(0xFF7B1FA2), // purple
-];
-
-/// Live editing state for one canvas element: its spatial placement, its
-/// [data], and (for text/subnote kinds) a [textController]/[focus] pair. [key]
-/// is a stable identity for widget keys across rebuilds.
-class _CanvasElement {
-  _CanvasElement({
-    required this.key,
-    required this.data,
-    this.dbId,
-    this.x = 0,
-    this.y = 0,
-    this.width,
-    this.height,
-    this.z = 0,
-  }) : textController = _makeController(data),
-       focus = data is StrokeElementData ? null : FocusNode();
-
-  final int key;
-
-  /// The `Elements` row id this element is persisted as, or null if it has not
-  /// been saved yet. Kept in sync by [_EntryEditorScreenState._save] so each
-  /// save updates the same row instead of re-inserting.
-  int? dbId;
-  double x;
-  double y;
-  double? width;
-  double? height;
-  int z;
-  final ElementData data;
-  final TextEditingController? textController;
-  final FocusNode? focus;
-
-  static TextEditingController? _makeController(ElementData d) {
-    if (d is TextElementData) return TextEditingController(text: d.text);
-    if (d is SubnoteElementData) return TextEditingController(text: d.text);
-    return null;
-  }
-
-  /// Writes the live text back into [data] so it can be persisted.
-  void syncToData() {
-    final d = data;
-    if (d is TextElementData) {
-      d.text = textController!.text;
-    } else if (d is SubnoteElementData) {
-      d.text = textController!.text;
-    }
-  }
-
-  PlacedElement toPlaced() => PlacedElement(
-    id: dbId,
-    x: x,
-    y: y,
-    width: width,
-    height: height,
-    z: z,
-    data: data,
-  );
-
-  void dispose() {
-    textController?.dispose();
-    focus?.dispose();
-  }
-}
+import 'canvas_controller.dart';
+import 'canvas_widgets.dart';
 
 /// Write or edit the journal entry for a given [date] as a free-form canvas of
 /// absolutely-positioned, layered elements — plain-text boxes, collapsible
 /// subnotes, and freehand pen strokes.
+///
+/// This is a thin view over a [CanvasController], which owns the document state,
+/// persistence, drawing capture and focus bookkeeping. The view keeps only the
+/// widget-tier resources (title field, pan/zoom transform, the shortcut/timestamp
+/// focus nodes) and renders from the controller via a [ListenableBuilder].
 class EntryEditorScreen extends StatefulWidget {
   const EntryEditorScreen({
     super.key,
@@ -130,7 +32,7 @@ class EntryEditorScreen extends StatefulWidget {
 class _EntryEditorScreenState extends State<EntryEditorScreen>
     with WidgetsBindingObserver {
   final _titleController = TextEditingController();
-  final _transform = TransformationController(_homeTransform());
+  final _transform = TransformationController(homeTransform());
 
   /// Keeps the timestamp button from taking focus away from the editor it is
   /// meant to insert into.
@@ -144,439 +46,58 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   /// empty text box — while keeping the Ctrl+key bindings reachable.
   final _canvasFocus = FocusNode(debugLabel: 'canvas');
 
-  final List<_CanvasElement> _elements = [];
-  bool _loading = true;
-  int _nextKey = 0;
-
-  _Tool _tool = _Tool.select;
-  _CanvasElement? _selected;
-
-  /// The element explicitly opened for editing — by tapping into its text, or by
-  /// creating a subnote — independent of the current tool. Cleared on blur.
-  _CanvasElement? _editing;
-
-  // Pen settings for the draw tool.
-  Color _penColor = _palette[0];
-  double _penWidth = StrokeElementData.defaultWidth;
-
-  /// Pen opacity, baked into a stroke's colour when it is committed. Kept above
-  /// [_minOpacity] so a stroke can never be drawn completely invisible.
-  double _penOpacity = 1;
-
-  static const double _minOpacity = 0.1;
-
-  /// The stroke currently being drawn, in canvas coordinates (null when idle).
-  /// A [ValueNotifier] (not a `setState` field) so that adding a point repaints
-  /// only the isolated live-stroke layer, never the whole element [Stack].
-  final ValueNotifier<List<Offset>?> _liveStroke = ValueNotifier(null);
-
   Size _viewport = Size.zero;
 
-  /// Set by every edit and cleared by [_save], so the autosave below only writes
-  /// when there is something to write.
-  bool _dirty = false;
-  Timer? _autosave;
-
-  /// The save currently in flight (null when idle). Every [_save] chains onto
-  /// this so writes never overlap — which is what lets a freshly-inserted
-  /// element's id be read back before the next save runs (no duplicate inserts).
-  Future<void>? _savePending;
-
-  /// How long an edit can sit unsaved. Closing the window (or killing the app)
-  /// doesn't reliably give us time to finish a write, so the entry is saved as
-  /// we go rather than only on the way out.
-  static const _autosaveInterval = Duration(seconds: 3);
+  late final CanvasController _controller;
 
   @override
   void initState() {
     super.initState();
-    _readOnly =
-        AppDatabase.dateOnly(widget.date) != AppDatabase.dateOnly(DateTime.now());
+    _controller = CanvasController(
+      database: widget.database,
+      date: widget.date,
+      scale: () => _transform.value.getMaxScaleOnAxis(),
+      readTitle: () => _titleController.text,
+      requestCanvasFocus: _canvasFocus.requestFocus,
+      showMessage: (message) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        }
+      },
+    );
     WidgetsBinding.instance.addObserver(this);
-    _autosave = Timer.periodic(_autosaveInterval, (_) {
-      if (_dirty) _save();
+    _controller.load().then((_) {
+      if (mounted) _titleController.text = _controller.loadedTitle;
     });
-    _load();
   }
 
   /// Leaving the app (backgrounded on mobile, window closing on desktop) flushes
   /// whatever hasn't been autosaved yet.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed && _dirty) _save();
-  }
-
-  void _markDirty() => _dirty = true;
-
-  Future<void> _load() async {
-    final String title;
-    final loaded = <_CanvasElement>[];
-    try {
-      final entry = await widget.database.entryForDate(widget.date);
-      title = entry?.title ?? '';
-      if (entry != null) {
-        final rows = await widget.database.elementsForEntry(entry.id);
-        for (final r in rows) {
-          final el = _CanvasElement(
-            key: _nextKey++,
-            data: ElementData.decode(r.type, r.data),
-            dbId: r.id,
-            x: r.x,
-            y: r.y,
-            width: r.width,
-            height: r.height,
-            z: r.z,
-          );
-          _attachFocus(el);
-          loaded.add(el);
-        }
-      }
-    } catch (_) {
-      // Don't leave the user stuck on the spinner: drop out of the loading
-      // state and surface the failure.
-      if (!mounted) return;
-      setState(() => _loading = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Couldn't open this entry.")),
-      );
-      return;
-    }
-    if (!mounted) return;
-    setState(() {
-      _titleController.text = title;
-      _elements.addAll(loaded);
-      _loading = false;
-    });
-  }
-
-  int get _topZ => _elements.isEmpty
-      ? 0
-      : _elements.map((e) => e.z).reduce((a, b) => a > b ? a : b);
-
-  /// Canvas coordinate at the centre of the current viewport, for placing new
-  /// elements somewhere visible.
-  Offset _visibleCenter() {
-    final screenCenter = Offset(_viewport.width / 2, _viewport.height / 2);
-    return _transform.toScene(screenCenter) - _canvasOrigin;
-  }
-
-  /// Only today's entry can be changed — past days are a read-only record.
-  /// Captured once at open (see [initState]) rather than recomputed from
-  /// `DateTime.now()`: if the editor is left open across midnight the session
-  /// keeps the editability it started with, so an in-progress entry keeps
-  /// autosaving to its (fixed) [EntryEditorScreen.date] instead of silently
-  /// going read-only and dropping edits.
-  late final bool _readOnly;
-
-  /// Whether elements can currently be moved/resized/selected.
-  bool get _moveEnabled => !_readOnly && _tool == _Tool.select;
-
-  /// Whether [el]'s editor is live: the text tool makes every box editable, and
-  /// a single box can also be opened on its own via [_beginEditing].
-  bool _isEditing(_CanvasElement el) =>
-      !_readOnly && (_tool == _Tool.text || identical(_editing, el));
-
-  void _select(_CanvasElement? el) {
-    if (_readOnly) return;
-    setState(() => _selected = el);
-  }
-
-  /// Opens [el]'s editor and puts the caret in it, whatever the current tool.
-  void _beginEditing(_CanvasElement el) {
-    if (_readOnly || el.focus == null) return;
-    setState(() {
-      _editing = el;
-      _selected = el;
-    });
-    // The field only stops being read-only once this rebuild lands.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) el.focus?.requestFocus();
-    });
-  }
-
-  /// Selecting a text/subnote follows keyboard focus: when a box's editor gains
-  /// focus (e.g. the user taps into it) it becomes the selected element, so the
-  /// selection frame and format toolbar target what's being edited. On losing
-  /// focus, a text box left empty (created but never written in) is discarded.
-  void _attachFocus(_CanvasElement el) {
-    final f = el.focus;
-    if (f == null) return;
-    f.addListener(() {
-      // A read-only (past) entry never selects or mutates anything, even if a
-      // field somehow takes focus.
-      if (_readOnly) return;
-      if (f.hasFocus) {
-        if (_selected != el) setState(() => _selected = el);
-      } else {
-        if (identical(_editing, el)) setState(() => _editing = null);
-        el.syncToData();
-        if (el.data is TextElementData && el.data.isEmpty) {
-          _removeElement(el);
-        }
-      }
-    });
-  }
-
-  void _removeElement(_CanvasElement el) {
-    if (!_elements.contains(el)) return;
-    _markDirty();
-    setState(() {
-      _elements.remove(el);
-      if (_selected == el) _selected = null;
-      if (identical(_editing, el)) _editing = null;
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
-  }
-
-  /// Public rebuild hook for child element widgets (they can't call the
-  /// protected [setState] directly). Anything routed through here is an edit —
-  /// typing, recolouring, collapsing — so it also arms the autosave.
-  void rebuild([VoidCallback? mutate]) {
-    _markDirty();
-    setState(() => mutate?.call());
-  }
-
-  _CanvasElement _add(
-    ElementData data, {
-    required double x,
-    required double y,
-    double? width,
-    double? height,
-  }) {
-    final el = _CanvasElement(
-      key: _nextKey++,
-      data: data,
-      x: x,
-      y: y,
-      width: width,
-      height: height,
-      z: _topZ + 1,
-    );
-    _attachFocus(el);
-    _markDirty();
-    setState(() {
-      _elements.add(el);
-      _selected = el;
-    });
-    return el;
-  }
-
-  void _addTextAt(Offset canvasPoint) {
-    final el = _add(
-      TextElementData.empty(),
-      x: canvasPoint.dx,
-      y: canvasPoint.dy,
-      width: 220,
-    );
-    // Stay in text mode so tapping empty canvas keeps adding boxes; the new box
-    // is focused so the user can type immediately.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) el.focus?.requestFocus();
-    });
-  }
-
-  void _addSubnote() {
-    if (_readOnly) return;
-    final c = _visibleCenter();
-    final el = _add(
-      SubnoteElementData.empty(),
-      x: c.dx - SubnoteElementData.defaultWidth / 2,
-      y: c.dy - SubnoteElementData.defaultHeight / 2,
-      width: SubnoteElementData.defaultWidth,
-      height: SubnoteElementData.defaultHeight,
-    );
-    // The draw tool puts every element behind an IgnorePointer, so leave it —
-    // otherwise keep the current tool and just open the new card for typing.
-    if (_tool == _Tool.draw) setState(() => _tool = _Tool.select);
-    _beginEditing(el);
-  }
-
-  void _deleteSelected() {
-    final el = _selected;
-    if (el == null) return;
-    _markDirty();
-    setState(() {
-      _elements.remove(el);
-      _selected = null;
-      if (identical(_editing, el)) _editing = null;
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) => el.dispose());
-  }
-
-  void _bringToFront() {
-    final el = _selected;
-    if (el == null) return;
-    _markDirty();
-    setState(() => el.z = _topZ + 1);
-  }
-
-  // --- Drawing (draw tool) -------------------------------------------------
-
-  void _onPointerDown(PointerDownEvent e) {
-    if (_tool != _Tool.draw) return;
-    // No setState: only the live-stroke layer (which listens to _liveStroke)
-    // needs to repaint, not the element Stack.
-    _liveStroke.value = [e.localPosition - _canvasOrigin];
-  }
-
-  void _onPointerMove(PointerMoveEvent e) {
-    if (_tool != _Tool.draw || _liveStroke.value == null) return;
-    // Reassign a new list so the notifier fires; the live-stroke CustomPaint
-    // repaints in isolation.
-    _liveStroke.value = [..._liveStroke.value!, e.localPosition - _canvasOrigin];
-  }
-
-  void _onPointerUp(PointerUpEvent e) {
-    if (_tool != _Tool.draw || _liveStroke.value == null) return;
-    final pts = _liveStroke.value!;
-    _liveStroke.value = null;
-    if (pts.isEmpty) return;
-    final pad = _penWidth / 2 + 1;
-    var minX = pts.first.dx, minY = pts.first.dy;
-    var maxX = pts.first.dx, maxY = pts.first.dy;
-    for (final p in pts) {
-      minX = p.dx < minX ? p.dx : minX;
-      minY = p.dy < minY ? p.dy : minY;
-      maxX = p.dx > maxX ? p.dx : maxX;
-      maxY = p.dy > maxY ? p.dy : maxY;
-    }
-    final origin = Offset(minX - pad, minY - pad);
-    final rel = [for (final p in pts) p - origin];
-    _add(
-      StrokeElementData(
-        points: rel,
-        color: _penColor.withValues(alpha: _penOpacity).toARGB32(),
-        width: _penWidth,
-      ),
-      x: origin.dx,
-      y: origin.dy,
-      width: maxX - minX + pad * 2,
-      height: maxY - minY + pad * 2,
-    );
-    // A stroke shouldn't leave the element "selected"; keep drawing fluidly.
-    setState(() => _selected = null);
-  }
-
-  // --- Canvas taps ---------------------------------------------------------
-
-  void _onCanvasTap(Offset canvasPoint) {
-    switch (_tool) {
-      case _Tool.text:
-        // Tapping empty canvas creates a new text box; tapping an existing box
-        // hits the box (not this background), so it edits instead of creating.
-        _addTextAt(canvasPoint);
-      case _Tool.select:
-        _canvasFocus.requestFocus();
-        _select(null);
-      case _Tool.draw:
-        break;
-    }
-  }
-
-  // --- Timestamp -----------------------------------------------------------
-
-  /// The text/subnote element whose editor currently has focus, if any.
-  _CanvasElement? get _focusedTextElement {
-    for (final el in _elements) {
-      if ((el.focus?.hasFocus ?? false) && el.textController != null) return el;
-    }
-    return null;
-  }
-
-  /// Inserts the current `HH:mm:ss` on its own new line in the focused text box
-  /// or subnote, leaving the caret on the line below it. Bound to Ctrl+T and the
-  /// clock toolbar button.
-  void _insertTimestamp() {
-    if (_readOnly) return;
-    final el = _focusedTextElement;
-    if (el == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Place the cursor in a text box or subnote first.'),
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
-    }
-    final c = el.textController!;
-    final stamp = DateFormat('HH:mm:ss').format(DateTime.now());
-    final text = c.text;
-    final sel = c.selection;
-    final at = (sel.isValid ? sel.end : text.length).clamp(0, text.length);
-
-    final before = text.substring(0, at);
-    final after = text.substring(at);
-    // Start a new line unless we're already at the start of one.
-    final lead = (before.isEmpty || before.endsWith('\n')) ? '' : '\n';
-    final insertion = '$lead$stamp\n';
-
-    c.value = TextEditingValue(
-      text: '$before$insertion$after',
-      selection: TextSelection.collapsed(
-        offset: before.length + insertion.length,
-      ),
-    );
-    el.syncToData();
-    rebuild();
-  }
-
-  // --- Save ----------------------------------------------------------------
-
-  Future<void> _save() {
-    if (_loading || _readOnly || !_dirty) return Future.value();
-    // Freeze content synchronously, before any await, so this is safe even when
-    // called from the pop path as the text controllers are about to be disposed.
-    _dirty = false;
-    for (final el in _elements) {
-      el.syncToData();
-    }
-    final els = List.of(_elements);
-    final title = _titleController.text;
-
-    // Serialize behind any in-flight save. The PlacedElements are built *inside*
-    // the chained op so each element's dbId is read after a prior op wrote it
-    // back — otherwise two overlapping autosaves could both insert the same new
-    // element.
-    final op = (_savePending ?? Future.value()).then((_) async {
-      final placed = [for (final el in els) el.toPlaced()];
-      try {
-        await widget.database.saveEntry(
-          widget.date,
-          title: title,
-          elements: placed,
-        );
-        for (var i = 0; i < els.length; i++) {
-          els[i].dbId = placed[i].id;
-        }
-      } catch (_) {
-        // Re-arm so the next tick (or pop) retries, and let the user know.
-        _dirty = true;
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Couldn't save — will retry.")),
-          );
-        }
-      }
-    });
-    _savePending = op.whenComplete(() {
-      if (identical(_savePending, op)) _savePending = null;
-    });
-    return _savePending!;
+    if (state != AppLifecycleState.resumed) _controller.save();
   }
 
   @override
   void dispose() {
-    _autosave?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _titleController.dispose();
     _transform.dispose();
     _timestampFocus.dispose();
     _canvasFocus.dispose();
-    _liveStroke.dispose();
-    for (final el in _elements) {
-      el.dispose();
-    }
+    _controller.dispose();
     super.dispose();
+  }
+
+  bool get _readOnly => _controller.readOnly;
+
+  /// Canvas coordinate at the centre of the current viewport, for placing new
+  /// elements somewhere visible.
+  Offset _visibleCenter() {
+    final screenCenter = Offset(_viewport.width / 2, _viewport.height / 2);
+    return _transform.toScene(screenCenter) - canvasOrigin;
   }
 
   @override
@@ -584,25 +105,25 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     return PopScope(
       canPop: true,
       onPopInvokedWithResult: (didPop, _) {
-        if (didPop) _save();
+        if (didPop) _controller.save();
       },
       child: CallbackShortcuts(
         bindings: {
           const SingleActivator(LogicalKeyboardKey.keyM, control: true): () =>
-              _setTool(_Tool.select),
+              _controller.setTool(Tool.select),
           const SingleActivator(LogicalKeyboardKey.keyT, control: true): () =>
-              _setTool(_Tool.text),
+              _controller.setTool(Tool.text),
           const SingleActivator(LogicalKeyboardKey.keyD, control: true): () =>
-              _setTool(_Tool.draw),
-          const SingleActivator(LogicalKeyboardKey.keyN, control: true):
-              _addSubnote,
+              _controller.setTool(Tool.draw),
+          const SingleActivator(LogicalKeyboardKey.keyN, control: true): () =>
+              _controller.addSubnote(at: _visibleCenter()),
           // Ctrl+Shift+T, since Ctrl+T selects the text tool. SingleActivator
           // matches modifiers exactly, so the two don't collide.
           const SingleActivator(
             LogicalKeyboardKey.keyT,
             control: true,
             shift: true,
-          ): _insertTimestamp,
+          ): _controller.insertTimestamp,
         },
         // Anchors focus inside the shortcut subtree so the bindings fire even
         // when no editor is focused. Key events from a focused text box bubble
@@ -614,29 +135,35 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
             appBar: AppBar(
               title: Text(DateFormat.yMMMMEEEEd().format(widget.date)),
             ),
-            body: _loading
-                ? const Center(child: CircularProgressIndicator())
-                : Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Padding(
-                        padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-                        child: TextField(
-                          controller: _titleController,
-                          readOnly: _readOnly,
-                          onChanged: (_) => _markDirty(),
-                          style: Theme.of(context).textTheme.titleLarge,
-                          decoration: const InputDecoration(
-                            border: InputBorder.none,
-                            hintText: 'Title (optional)',
-                          ),
+            body: ListenableBuilder(
+              listenable: _controller,
+              builder: (context, _) {
+                if (_controller.loading) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      child: TextField(
+                        controller: _titleController,
+                        readOnly: _readOnly,
+                        onChanged: (_) => _controller.markDirty(),
+                        style: Theme.of(context).textTheme.titleLarge,
+                        decoration: const InputDecoration(
+                          border: InputBorder.none,
+                          hintText: 'Title (optional)',
                         ),
                       ),
-                      _toolbar(context),
-                      const Divider(height: 1),
-                      Expanded(child: _canvas(context)),
-                    ],
-                  ),
+                    ),
+                    _toolbar(context),
+                    const Divider(height: 1),
+                    Expanded(child: _canvas(context)),
+                  ],
+                );
+              },
+            ),
           ),
         ),
       ),
@@ -667,7 +194,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
             IconButton(
               icon: const Icon(Icons.center_focus_strong),
               tooltip: 'Reset view',
-              onPressed: () => _transform.value = _homeTransform(),
+              onPressed: () => _transform.value = homeTransform(),
             ),
           ],
         ),
@@ -684,19 +211,19 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
               _toolButton(
                 Icons.pan_tool_alt_outlined,
                 'Select / move (Ctrl+M)',
-                _Tool.select,
+                Tool.select,
               ),
               _toolButton(
                 Icons.text_fields,
                 'Add text — tap canvas (Ctrl+T)',
-                _Tool.text,
+                Tool.text,
               ),
-              _toolButton(Icons.edit, 'Draw (Ctrl+D)', _Tool.draw),
+              _toolButton(Icons.edit, 'Draw (Ctrl+D)', Tool.draw),
               const SizedBox(width: 8),
               IconButton(
                 icon: const Icon(Icons.sticky_note_2_outlined),
                 tooltip: 'Add subnote (Ctrl+N)',
-                onPressed: _addSubnote,
+                onPressed: () => _controller.addSubnote(at: _visibleCenter()),
               ),
               IconButton(
                 // Must not steal focus from the editor being typed in, or the
@@ -705,13 +232,13 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                 focusNode: _timestampFocus,
                 icon: const Icon(Icons.schedule),
                 tooltip: 'Insert timestamp (Ctrl+Shift+T)',
-                onPressed: _insertTimestamp,
+                onPressed: _controller.insertTimestamp,
               ),
               const Spacer(),
               IconButton(
                 icon: const Icon(Icons.center_focus_strong),
                 tooltip: 'Reset view',
-                onPressed: () => _transform.value = _homeTransform(),
+                onPressed: () => _transform.value = homeTransform(),
               ),
             ],
           ),
@@ -721,33 +248,24 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
-  /// Switches the active tool (from a toolbar button or a Ctrl+key shortcut).
-  void _setTool(_Tool tool) {
-    if (_readOnly) return;
-    // Moving focus to the canvas discards any empty text box being left behind
-    // and makes text non-interactive in select/draw mode.
-    _canvasFocus.requestFocus();
-    setState(() => _tool = tool);
-  }
-
-  Widget _toolButton(IconData icon, String tip, _Tool tool) {
-    final active = _tool == tool;
+  Widget _toolButton(IconData icon, String tip, Tool tool) {
+    final active = _controller.tool == tool;
     return IconButton(
       icon: Icon(icon),
       tooltip: tip,
       isSelected: active,
       color: active ? Theme.of(context).colorScheme.primary : null,
-      onPressed: () => _setTool(tool),
+      onPressed: () => _controller.setTool(tool),
     );
   }
 
   /// Second toolbar row: pen options when drawing, or format/actions when an
   /// element is selected. Empty otherwise.
   Widget _contextRow(BuildContext context) {
-    if (_tool == _Tool.draw) {
+    if (_controller.tool == Tool.draw) {
       return _penOptions(context);
     }
-    final el = _selected;
+    final el = _controller.selected;
     if (el != null && el.data is! StrokeElementData) {
       return _formatOptions(context, el);
     }
@@ -763,27 +281,31 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
       child: Row(
         children: [
           const SizedBox(width: 8),
-          for (final c in _palette)
-            _swatch(c, _penColor == c, () => setState(() => _penColor = c)),
+          for (final c in palette)
+            _swatch(
+              c,
+              _controller.penColor == c,
+              () => _controller.setPenColor(c),
+            ),
           const SizedBox(width: 12),
           const Icon(Icons.line_weight, size: 18),
           Expanded(
             child: Slider(
               min: 1,
               max: 16,
-              value: _penWidth,
-              onChanged: (v) => setState(() => _penWidth = v),
+              value: _controller.penWidth,
+              onChanged: _controller.setPenWidth,
             ),
           ),
           const Icon(Icons.opacity, size: 18),
           Expanded(
             child: Slider(
-              min: _minOpacity,
+              min: minOpacity,
               max: 1,
-              value: _penOpacity,
-              label: '${(_penOpacity * 100).round()}%',
+              value: _controller.penOpacity,
+              label: '${(_controller.penOpacity * 100).round()}%',
               divisions: 9,
-              onChanged: (v) => setState(() => _penOpacity = v),
+              onChanged: _controller.setPenOpacity,
             ),
           ),
           const SizedBox(width: 8),
@@ -792,7 +314,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
-  Widget _strokeOptions(BuildContext context, _CanvasElement el) {
+  Widget _strokeOptions(BuildContext context, CanvasElement el) {
     final data = el.data as StrokeElementData;
     final color = Color(data.color);
     return SizedBox(
@@ -803,14 +325,14 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
           const Icon(Icons.opacity, size: 18),
           Expanded(
             child: Slider(
-              min: _minOpacity,
+              min: minOpacity,
               max: 1,
-              value: color.a.clamp(_minOpacity, 1.0),
+              value: color.a.clamp(minOpacity, 1.0),
               label: '${(color.a * 100).round()}%',
               divisions: 9,
               // Transparency lives in the stroke's colour, so re-tinting it in
               // place is all it takes to make an existing line see-through.
-              onChanged: (v) => rebuild(
+              onChanged: (v) => _controller.edit(
                 () => data.color = color.withValues(alpha: v).toARGB32(),
               ),
             ),
@@ -818,14 +340,14 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
           IconButton(
             icon: const Icon(Icons.delete_outline),
             tooltip: 'Delete',
-            onPressed: _deleteSelected,
+            onPressed: _controller.deleteSelected,
           ),
         ],
       ),
     );
   }
 
-  Widget _formatOptions(BuildContext context, _CanvasElement el) {
+  Widget _formatOptions(BuildContext context, CanvasElement el) {
     double fontSize;
     int? colorValue;
     final d = el.data;
@@ -840,7 +362,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     }
 
     void setFont(double v) {
-      setState(() {
+      _controller.edit(() {
         if (d is TextElementData) {
           d.fontSize = v;
         } else if (d is SubnoteElementData) {
@@ -850,7 +372,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     }
 
     void setColor(int? v) {
-      setState(() {
+      _controller.edit(() {
         if (d is TextElementData) {
           d.color = v;
         } else if (d is SubnoteElementData) {
@@ -877,7 +399,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
             onPressed: () => setFont((fontSize + 2).clamp(8, 96)),
           ),
           const VerticalDivider(width: 8),
-          for (final c in _palette)
+          for (final c in palette)
             _swatch(
               c,
               colorValue == c.toARGB32(),
@@ -887,12 +409,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
           IconButton(
             icon: const Icon(Icons.flip_to_front),
             tooltip: 'Bring to front',
-            onPressed: _bringToFront,
+            onPressed: _controller.bringToFront,
           ),
           IconButton(
             icon: const Icon(Icons.delete_outline),
             tooltip: 'Delete',
-            onPressed: _deleteSelected,
+            onPressed: _controller.deleteSelected,
           ),
         ],
       ),
@@ -930,7 +452,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     // canvas, but zoom (pinch / mouse-wheel / ctrl+scroll) stays enabled — those
     // go through InteractiveViewer's scale path, while drawing is captured by the
     // child Listener independent of the gesture arena.
-    final allowPan = _tool != _Tool.draw;
+    final allowPan = _controller.tool != Tool.draw;
     return LayoutBuilder(
       builder: (context, constraints) {
         _viewport = Size(constraints.maxWidth, constraints.maxHeight);
@@ -943,12 +465,12 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
             panEnabled: allowPan,
             scaleEnabled: true,
             child: SizedBox(
-              width: _canvasSize,
-              height: _canvasSize,
+              width: canvasSize,
+              height: canvasSize,
               child: Listener(
-                onPointerDown: _onPointerDown,
-                onPointerMove: _onPointerMove,
-                onPointerUp: _onPointerUp,
+                onPointerDown: _controller.onPointerDown,
+                onPointerMove: _controller.onPointerMove,
+                onPointerUp: _controller.onPointerUp,
                 child: Stack(
                   children: [
                     // Background: catches taps for placing text / deselecting.
@@ -957,34 +479,38 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTapUp: (d) =>
-                            _onCanvasTap(d.localPosition - _canvasOrigin),
+                        onTapUp: (d) => _controller.onCanvasTap(
+                          d.localPosition - canvasOrigin,
+                        ),
                         child: RepaintBoundary(
-                          child: _CanvasBackground(
+                          child: CanvasBackground(
                             transform: _transform,
                             viewport: _viewport,
                           ),
                         ),
                       ),
                     ),
-                    for (final el in _sortedByZ()) _buildElement(context, el),
+                    for (final el in _controller.sortedByZ())
+                      _buildElement(context, el),
                     // Live drawing preview: mounted whenever the draw tool is
                     // active and isolated in its own RepaintBoundary, so adding a
                     // point repaints only this layer (not the element Stack).
-                    if (_tool == _Tool.draw)
+                    if (_controller.tool == Tool.draw)
                       Positioned.fill(
                         child: IgnorePointer(
                           // The in-progress points are canvas coordinates, so the
                           // preview paints from the origin, not the surface's
                           // top-left corner.
                           child: Transform.translate(
-                            offset: _canvasOrigin,
+                            offset: canvasOrigin,
                             child: RepaintBoundary(
                               child: CustomPaint(
-                                painter: _LiveStrokePainter(
-                                  points: _liveStroke,
-                                  color: _penColor.withValues(alpha: _penOpacity),
-                                  width: _penWidth,
+                                painter: LiveStrokePainter(
+                                  points: _controller.liveStroke,
+                                  color: _controller.penColor.withValues(
+                                    alpha: _controller.penOpacity,
+                                  ),
+                                  width: _controller.penWidth,
                                 ),
                               ),
                             ),
@@ -1001,46 +527,38 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
-  /// Strokes always sit beneath text and subnotes. A stroke's hit area is its
-  /// whole bounding box, so a stroke drawn *around* a text box (circling it, say)
-  /// would otherwise cover it and swallow every click meant for the text.
-  static int _layer(_CanvasElement el) => el.data is StrokeElementData ? 0 : 1;
-
-  List<_CanvasElement> _sortedByZ() {
-    final list = [..._elements]
-      ..sort((a, b) {
-        final byLayer = _layer(a).compareTo(_layer(b));
-        return byLayer != 0 ? byLayer : a.z.compareTo(b.z);
-      });
-    return list;
-  }
-
-  Widget _buildElement(BuildContext context, _CanvasElement el) {
+  Widget _buildElement(BuildContext context, CanvasElement el) {
     final data = el.data;
     if (data is StrokeElementData) {
       return _positioned(
         el,
-        _DragSurface(
-          enabled: _moveEnabled,
-          onSelect: () => _select(el),
-          onDelta: (d) => _drag(el, d),
+        DragSurface(
+          enabled: _controller.moveEnabled,
+          onSelect: () => _controller.select(el),
+          onDelta: (d) => _controller.drag(el, d),
           child: CustomPaint(
             size: Size(el.width ?? 0, el.height ?? 0),
-            painter: _StrokePainter(
+            painter: StrokePainter(
               data.points,
               Color(data.color),
               data.width,
-              selected: _selected == el,
+              selected: _controller.selected == el,
             ),
           ),
         ),
       );
     }
     if (data is SubnoteElementData) {
-      return _positioned(el, _SubnoteCard(state: this, el: el, data: data));
+      return _positioned(
+        el,
+        SubnoteCard(controller: _controller, el: el, data: data),
+      );
     }
     if (data is TextElementData) {
-      return _positioned(el, _TextBox(state: this, el: el, data: data));
+      return _positioned(
+        el,
+        TextBox(controller: _controller, el: el, data: data),
+      );
     }
     return _positioned(
       el,
@@ -1052,7 +570,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     );
   }
 
-  Widget _positioned(_CanvasElement el, Widget child) {
+  Widget _positioned(CanvasElement el, Widget child) {
     // Text boxes always auto-size vertically (never impose a fixed height, which
     // could clip growing text); a collapsed subnote shrinks to just its header.
     final data = el.data;
@@ -1066,603 +584,19 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     // Reserving the space here (rather than letting the bar overflow the box) is
     // what makes the bar hit-testable: a render box never hit-tests outside its
     // own bounds, however it paints.
-    final bar = _selected == el ? _Frame.barHeight : 0.0;
+    final bar = _controller.selected == el ? Frame.barHeight : 0.0;
     return Positioned(
       key: ValueKey(el.key),
-      left: el.x + _canvasOrigin.dx,
-      top: el.y + _canvasOrigin.dy - bar,
+      left: el.x + canvasOrigin.dx,
+      top: el.y + canvasOrigin.dy - bar,
       width: el.width,
       height: height == null ? null : height + bar,
       // While drawing, elements don't intercept pointers so strokes can be laid
       // over them freely.
-      child: IgnorePointer(ignoring: _tool == _Tool.draw, child: child),
-    );
-  }
-
-  /// Current InteractiveViewer scale, so screen drag deltas map to canvas px.
-  double get _scale => _transform.value.getMaxScaleOnAxis();
-
-  /// [delta] is a screen-space drag delta; dividing by [_scale] converts it to
-  /// canvas pixels.
-  void _drag(_CanvasElement el, Offset delta) {
-    _markDirty();
-    setState(() {
-      el.x += delta.dx / _scale;
-      el.y += delta.dy / _scale;
-    });
-  }
-
-  void _resize(_CanvasElement el, Offset delta) {
-    _markDirty();
-    setState(() {
-      el.width = ((el.width ?? 120) + delta.dx / _scale).clamp(60.0, 2000.0);
-      // Text boxes grow only horizontally; their height follows their content.
-      if (el.data is! TextElementData) {
-        el.height = ((el.height ?? 80) + delta.dy / _scale).clamp(40.0, 2000.0);
-      }
-    });
-  }
-}
-
-/// A pan recognizer that claims the gesture arena as soon as the pointer goes
-/// down. The canvas's [InteractiveViewer] installs a `ScaleGestureRecognizer`
-/// over the whole surface which otherwise steals element drags (it wins the
-/// arena even with `panEnabled`/`scaleEnabled` false). Accepting eagerly means a
-/// drag that *starts on an element* moves that element instead of panning.
-class _EagerPanRecognizer extends PanGestureRecognizer {
-  @override
-  void addAllowedPointer(PointerDownEvent event) {
-    super.addAllowedPointer(event);
-    resolve(GestureDisposition.accepted);
-  }
-}
-
-/// Drags [child] using an [_EagerPanRecognizer], reporting screen-space deltas.
-/// Because the gesture is claimed on pointer-down, nothing inside [child] can
-/// receive taps — keep buttons outside it. [onTap] stands in for the tap the
-/// recognizer swallows: it fires when the pointer is released having travelled
-/// less than the touch slop.
-class _EagerDrag extends StatefulWidget {
-  const _EagerDrag({
-    required this.onDelta,
-    required this.child,
-    this.onDown,
-    this.onTap,
-  });
-
-  final ValueChanged<Offset> onDelta;
-  final VoidCallback? onDown;
-  final VoidCallback? onTap;
-  final Widget child;
-
-  @override
-  State<_EagerDrag> createState() => _EagerDragState();
-}
-
-class _EagerDragState extends State<_EagerDrag> {
-  /// Distance travelled since pointer-down, to tell a tap from a drag.
-  double _travel = 0;
-
-  @override
-  Widget build(BuildContext context) {
-    return RawGestureDetector(
-      behavior: HitTestBehavior.opaque,
-      gestures: {
-        _EagerPanRecognizer:
-            GestureRecognizerFactoryWithHandlers<_EagerPanRecognizer>(
-              _EagerPanRecognizer.new,
-              (r) {
-                r.onDown = (_) {
-                  _travel = 0;
-                  widget.onDown?.call();
-                };
-                r.onUpdate = (d) {
-                  _travel += d.delta.distance;
-                  widget.onDelta(d.delta);
-                };
-                r.onEnd = (_) {
-                  if (_travel < kTouchSlop) widget.onTap?.call();
-                };
-              },
-            ),
-      },
-      child: widget.child,
-    );
-  }
-}
-
-/// A surface that selects its element on pointer-down and moves it on drag.
-/// When [enabled] is false (text/draw tool) it only handles taps, leaving drags
-/// to the canvas. [onTap] (if given) fires on a click that didn't drag.
-class _DragSurface extends StatelessWidget {
-  const _DragSurface({
-    required this.enabled,
-    required this.onSelect,
-    required this.onDelta,
-    required this.child,
-    this.onTap,
-  });
-
-  final bool enabled;
-  final VoidCallback onSelect;
-  final VoidCallback? onTap;
-
-  /// Screen-space drag delta.
-  final ValueChanged<Offset> onDelta;
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    if (!enabled) {
-      return GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: onTap ?? onSelect,
+      child: IgnorePointer(
+        ignoring: _controller.tool == Tool.draw,
         child: child,
-      );
-    }
-    // Pointer-down selects: a click without movement still selects, since the
-    // eager pan swallows the tap gesture.
-    return _EagerDrag(
-      onDown: onSelect,
-      onDelta: onDelta,
-      onTap: onTap,
-      child: child,
-    );
-  }
-}
-
-/// A faint dotted background so the (otherwise blank) canvas reads as a surface.
-class _CanvasBackground extends StatelessWidget {
-  const _CanvasBackground({required this.transform, required this.viewport});
-
-  final TransformationController transform;
-  final Size viewport;
-
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: _GridPainter(
-        color: Theme.of(context).dividerColor.withValues(alpha: 0.4),
-        transform: transform,
-        viewport: viewport,
       ),
-    );
-  }
-}
-
-class _GridPainter extends CustomPainter {
-  _GridPainter({
-    required this.color,
-    required this.transform,
-    required this.viewport,
-  }) : super(repaint: transform);
-
-  final Color color;
-  final TransformationController transform;
-  final Size viewport;
-
-  static const double _step = 40.0;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (viewport.isEmpty) return;
-    // Only the slice of the (huge) surface currently on screen is worth
-    // painting. Map the viewport back into surface coordinates and clamp it to
-    // the surface bounds, then walk only that window's grid.
-    final visible = MatrixUtils.inverseTransformRect(
-      transform.value,
-      Offset.zero & viewport,
-    ).intersect(Offset.zero & size);
-    if (visible.isEmpty) return;
-
-    // Snap the window's edges down to the grid so dots stay aligned.
-    final startX = (visible.left / _step).floor() * _step;
-    final startY = (visible.top / _step).floor() * _step;
-
-    final paint = Paint()..color = color;
-    for (double x = startX; x <= visible.right; x += _step) {
-      for (double y = startY; y <= visible.bottom; y += _step) {
-        canvas.drawCircle(Offset(x, y), 0.8, paint);
-      }
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _GridPainter old) =>
-      old.color != color || old.viewport != viewport;
-}
-
-/// Paints the in-progress freehand stroke as its points arrive. Listens to
-/// [points] via its `repaint` argument so only this layer repaints per point;
-/// [color]/[width] are fixed for the duration of a stroke.
-class _LiveStrokePainter extends CustomPainter {
-  _LiveStrokePainter({
-    required this.points,
-    required this.color,
-    required this.width,
-  }) : super(repaint: points);
-
-  final ValueListenable<List<Offset>?> points;
-  final Color color;
-  final double width;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final pts = points.value;
-    if (pts == null || pts.isEmpty) return;
-    _paintStrokePath(
-      canvas,
-      pts,
-      Paint()
-        ..color = color
-        ..strokeWidth = width
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round,
-    );
-  }
-
-  @override
-  bool shouldRepaint(covariant _LiveStrokePainter old) =>
-      old.color != color || old.width != width;
-}
-
-/// Draws a freehand stroke (a dot for a single point, a joined path otherwise)
-/// from [points] in the canvas's local space. Shared by the committed-stroke
-/// [_StrokePainter] and the live [_LiveStrokePainter].
-void _paintStrokePath(Canvas canvas, List<Offset> points, Paint paint) {
-  if (points.isEmpty) return;
-  if (points.length == 1) {
-    canvas.drawPoints(PointMode.points, points, paint);
-  } else {
-    final path = Path()..moveTo(points.first.dx, points.first.dy);
-    for (var i = 1; i < points.length; i++) {
-      path.lineTo(points[i].dx, points[i].dy);
-    }
-    canvas.drawPath(path, paint);
-  }
-}
-
-/// Paints a freehand stroke from a list of points (in the painter's local
-/// coordinate space). Adds a subtle highlight box when [selected].
-class _StrokePainter extends CustomPainter {
-  _StrokePainter(this.points, this.color, this.width, {this.selected = false});
-
-  final List<Offset> points;
-  final Color color;
-  final double width;
-  final bool selected;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (points.isEmpty) return;
-    _paintStrokePath(
-      canvas,
-      points,
-      Paint()
-        ..color = color
-        ..strokeWidth = width
-        ..style = PaintingStyle.stroke
-        ..strokeCap = StrokeCap.round
-        ..strokeJoin = StrokeJoin.round,
-    );
-    if (selected && size.width > 0) {
-      canvas.drawRect(
-        Offset.zero & size,
-        Paint()
-          ..color = color.withValues(alpha: 0.4)
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 1,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _StrokePainter old) =>
-      old.points != points ||
-      old.color != color ||
-      old.width != width ||
-      old.selected != selected;
-}
-
-/// A movable, resizable plain-text box. Tapping selects it; when selected a
-/// frame with a move bar and a resize handle appears and the text is editable.
-class _TextBox extends StatelessWidget {
-  const _TextBox({required this.state, required this.el, required this.data});
-
-  final _EntryEditorScreenState state;
-  final _CanvasElement el;
-  final TextElementData data;
-
-  @override
-  Widget build(BuildContext context) {
-    final selected = state._selected == el;
-    final editing = state._isEditing(el);
-    final style = TextStyle(
-      fontSize: data.fontSize,
-      color: data.color != null ? Color(data.color!) : null,
-    );
-
-    final field = TextField(
-      controller: el.textController,
-      focusNode: el.focus,
-      readOnly: !editing,
-      maxLines: null,
-      style: style,
-      cursorColor: Theme.of(context).colorScheme.primary,
-      decoration: const InputDecoration(
-        isDense: true,
-        border: InputBorder.none,
-        hintText: 'Write…',
-        contentPadding: EdgeInsets.all(6),
-      ),
-      onChanged: (_) => state.rebuild(),
-    );
-
-    // Text tool: the field is live — tapping it focuses/edits (and selects via
-    // the focus listener).
-    if (editing) {
-      return _Frame(
-        selected: selected,
-        onMove: (d) => state._drag(el, d),
-        onResize: (d) => state._resize(el, d),
-        child: field,
-      );
-    }
-    // Otherwise the field is inert and a transparent overlay on top of it is the
-    // drag surface: pointer-down selects, a drag moves, a click opens the editor.
-    return _Frame(
-      selected: selected,
-      onMove: (d) => state._drag(el, d),
-      onResize: (d) => state._resize(el, d),
-      child: Stack(
-        children: [
-          IgnorePointer(child: field),
-          Positioned.fill(
-            child: _DragSurface(
-              enabled: state._moveEnabled,
-              onSelect: () => state._select(el),
-              onDelta: (d) => state._drag(el, d),
-              onTap: () => state._beginEditing(el),
-              child: const SizedBox.expand(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// A floating, collapsible subnote card. The header (tap to collapse/expand) is
-/// always shown; the body is an editable text area when expanded.
-class _SubnoteCard extends StatelessWidget {
-  const _SubnoteCard({
-    required this.state,
-    required this.el,
-    required this.data,
-  });
-
-  final _EntryEditorScreenState state;
-  final _CanvasElement el;
-  final SubnoteElementData data;
-
-  String get _headerText {
-    final t = (el.textController?.text ?? data.text).trim();
-    if (t.isEmpty) return 'Subnote';
-    final first = t.split('\n').first;
-    return first.length > 40 ? '${first.substring(0, 40)}…' : first;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    final selected = state._selected == el;
-    final editing = state._isEditing(el);
-
-    // The chevron stays OUTSIDE the drag surface: the eager pan recognizer
-    // claims the gesture on pointer-down, so anything inside the surface can no
-    // longer receive taps. The rest of the header is the move handle.
-    final header = Padding(
-      padding: const EdgeInsets.fromLTRB(2, 0, 6, 0),
-      child: Row(
-        children: [
-          IconButton(
-            visualDensity: VisualDensity.compact,
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
-            iconSize: 18,
-            icon: Icon(
-              data.collapsed ? Icons.chevron_right : Icons.keyboard_arrow_down,
-            ),
-            tooltip: data.collapsed ? 'Expand' : 'Collapse',
-            onPressed: () =>
-                state.rebuild(() => data.collapsed = !data.collapsed),
-          ),
-          Expanded(
-            child: MouseRegion(
-              cursor: SystemMouseCursors.move,
-              child: _DragSurface(
-                enabled: state._moveEnabled,
-                onSelect: () => state._select(el),
-                onDelta: (d) => state._drag(el, d),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        _headerText,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.labelLarge,
-                      ),
-                    ),
-                    Icon(
-                      Icons.drag_indicator,
-                      size: 16,
-                      color: Theme.of(context).disabledColor,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-
-    final body = TextField(
-      controller: el.textController,
-      focusNode: el.focus,
-      readOnly: !editing,
-      maxLines: null,
-      expands: true,
-      textAlignVertical: TextAlignVertical.top,
-      style: TextStyle(
-        fontSize: data.fontSize,
-        color: data.color != null ? Color(data.color!) : null,
-      ),
-      decoration: const InputDecoration(
-        isDense: true,
-        border: InputBorder.none,
-        hintText: 'Subnote…',
-        contentPadding: EdgeInsets.fromLTRB(8, 0, 8, 8),
-      ),
-      onChanged: (_) => state.rebuild(),
-    );
-
-    final card = Container(
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withValues(alpha: 0.9),
-        border: Border(left: BorderSide(color: scheme.primary, width: 3)),
-        borderRadius: const BorderRadius.horizontal(right: Radius.circular(6)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          header,
-          if (!data.collapsed)
-            Expanded(
-              // While editing, the body is live and takes text. Otherwise it's
-              // inert and doubles as a drag surface, so the card moves from
-              // anywhere — and a click (not a drag) opens the editor.
-              child: editing
-                  ? body
-                  : _DragSurface(
-                      enabled: state._moveEnabled,
-                      onSelect: () => state._select(el),
-                      onDelta: (d) => state._drag(el, d),
-                      onTap: () => state._beginEditing(el),
-                      child: IgnorePointer(child: body),
-                    ),
-            ),
-        ],
-      ),
-    );
-
-    return _Frame(
-      selected: selected,
-      onMove: (d) => state._drag(el, d),
-      onResize: data.collapsed ? null : (d) => state._resize(el, d),
-      child: card,
-    );
-  }
-}
-
-/// Wraps a selected element with a highlight frame, a top move bar, and a
-/// bottom-right resize handle. When not selected it just shows [child].
-///
-/// The move bar occupies [barHeight] at the top of the frame; the caller
-/// ([_EntryEditorScreenState._positioned]) grows the element upwards by the same
-/// amount when it is selected, so the content stays where it was and the bar
-/// stays inside the frame's bounds — a render box never hit-tests outside them.
-class _Frame extends StatelessWidget {
-  const _Frame({
-    required this.selected,
-    required this.child,
-    required this.onMove,
-    this.onResize,
-  });
-
-  static const double barHeight = 14;
-
-  final bool selected;
-  final Widget child;
-
-  /// Screen-space drag deltas.
-  final ValueChanged<Offset> onMove;
-  final ValueChanged<Offset>? onResize;
-
-  @override
-  Widget build(BuildContext context) {
-    final primary = Theme.of(context).colorScheme.primary;
-    if (!selected) {
-      return Container(
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.transparent),
-        ),
-        child: child,
-      );
-    }
-    return Stack(
-      clipBehavior: Clip.none,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(top: barHeight),
-          child: Container(
-            decoration: BoxDecoration(
-              border: Border.all(color: primary, width: 1.5),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: child,
-          ),
-        ),
-        // Move bar along the top edge, in the space reserved for it.
-        Positioned(
-          left: 0,
-          right: 0,
-          top: 0,
-          height: barHeight,
-          child: MouseRegion(
-            cursor: SystemMouseCursors.move,
-            child: _EagerDrag(
-              onDelta: onMove,
-              child: Container(
-                color: primary,
-                alignment: Alignment.center,
-                child: const Icon(
-                  Icons.drag_indicator,
-                  size: 12,
-                  color: Colors.white,
-                ),
-              ),
-            ),
-          ),
-        ),
-        if (onResize != null)
-          Positioned(
-            right: -6,
-            bottom: -6,
-            child: MouseRegion(
-              cursor: SystemMouseCursors.resizeDownRight,
-              child: _EagerDrag(
-                onDelta: onResize!,
-                child: Container(
-                  width: 16,
-                  height: 16,
-                  decoration: BoxDecoration(
-                    color: primary,
-                    shape: BoxShape.circle,
-                  ),
-                  child: const Icon(
-                    Icons.open_in_full,
-                    size: 10,
-                    color: Colors.white,
-                  ),
-                ),
-              ),
-            ),
-          ),
-      ],
     );
   }
 }
