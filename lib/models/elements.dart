@@ -51,6 +51,7 @@ sealed class ElementData {
 /// stores the placement in columns and the content as JSON).
 class PlacedElement {
   PlacedElement({
+    this.id,
     required this.x,
     required this.y,
     this.width,
@@ -58,6 +59,12 @@ class PlacedElement {
     this.z = 0,
     required this.data,
   });
+
+  /// The `Elements` row id this element is persisted as, or null if it hasn't
+  /// been written yet. [AppDatabase.saveEntry] reads it to pick UPDATE vs
+  /// INSERT and writes it back after an insert, so subsequent saves target the
+  /// same row instead of deleting and re-inserting.
+  int? id;
 
   double x;
   double y;

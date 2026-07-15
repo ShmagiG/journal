@@ -54,6 +54,7 @@ class _CanvasElement {
   _CanvasElement({
     required this.key,
     required this.data,
+    this.dbId,
     this.x = 0,
     this.y = 0,
     this.width,
@@ -63,6 +64,11 @@ class _CanvasElement {
        focus = data is StrokeElementData ? null : FocusNode();
 
   final int key;
+
+  /// The `Elements` row id this element is persisted as, or null if it has not
+  /// been saved yet. Kept in sync by [_EntryEditorScreenState._save] so each
+  /// save updates the same row instead of re-inserting.
+  int? dbId;
   double x;
   double y;
   double? width;
@@ -88,8 +94,15 @@ class _CanvasElement {
     }
   }
 
-  PlacedElement toPlaced() =>
-      PlacedElement(x: x, y: y, width: width, height: height, z: z, data: data);
+  PlacedElement toPlaced() => PlacedElement(
+    id: dbId,
+    x: x,
+    y: y,
+    width: width,
+    height: height,
+    z: z,
+    data: data,
+  );
 
   void dispose() {
     textController?.dispose();
@@ -164,6 +177,11 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   bool _dirty = false;
   Timer? _autosave;
 
+  /// The save currently in flight (null when idle). Every [_save] chains onto
+  /// this so writes never overlap — which is what lets a freshly-inserted
+  /// element's id be read back before the next save runs (no duplicate inserts).
+  Future<void>? _savePending;
+
   /// How long an edit can sit unsaved. Closing the window (or killing the app)
   /// doesn't reliably give us time to finish a write, so the entry is saved as
   /// we go rather than only on the way out.
@@ -191,27 +209,41 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
   void _markDirty() => _dirty = true;
 
   Future<void> _load() async {
-    final entry = await widget.database.entryForDate(widget.date);
+    final String title;
     final loaded = <_CanvasElement>[];
-    if (entry != null) {
-      final rows = await widget.database.elementsForEntry(entry.id);
-      for (final r in rows) {
-        final el = _CanvasElement(
-          key: _nextKey++,
-          data: ElementData.decode(r.type, r.data),
-          x: r.x,
-          y: r.y,
-          width: r.width,
-          height: r.height,
-          z: r.z,
-        );
-        _attachFocus(el);
-        loaded.add(el);
+    try {
+      final entry = await widget.database.entryForDate(widget.date);
+      title = entry?.title ?? '';
+      if (entry != null) {
+        final rows = await widget.database.elementsForEntry(entry.id);
+        for (final r in rows) {
+          final el = _CanvasElement(
+            key: _nextKey++,
+            data: ElementData.decode(r.type, r.data),
+            dbId: r.id,
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            z: r.z,
+          );
+          _attachFocus(el);
+          loaded.add(el);
+        }
       }
+    } catch (_) {
+      // Don't leave the user stuck on the spinner: drop out of the loading
+      // state and surface the failure.
+      if (!mounted) return;
+      setState(() => _loading = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Couldn't open this entry.")),
+      );
+      return;
     }
     if (!mounted) return;
     setState(() {
-      _titleController.text = entry?.title ?? '';
+      _titleController.text = title;
       _elements.addAll(loaded);
       _loading = false;
     });
@@ -490,17 +522,46 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
 
   // --- Save ----------------------------------------------------------------
 
-  Future<void> _save() async {
-    if (_loading || _readOnly) return;
+  Future<void> _save() {
+    if (_loading || _readOnly || !_dirty) return Future.value();
+    // Freeze content synchronously, before any await, so this is safe even when
+    // called from the pop path as the text controllers are about to be disposed.
     _dirty = false;
     for (final el in _elements) {
       el.syncToData();
     }
-    await widget.database.saveEntry(
-      widget.date,
-      title: _titleController.text,
-      elements: _elements.map((e) => e.toPlaced()).toList(),
-    );
+    final els = List.of(_elements);
+    final title = _titleController.text;
+
+    // Serialize behind any in-flight save. The PlacedElements are built *inside*
+    // the chained op so each element's dbId is read after a prior op wrote it
+    // back — otherwise two overlapping autosaves could both insert the same new
+    // element.
+    final op = (_savePending ?? Future.value()).then((_) async {
+      final placed = [for (final el in els) el.toPlaced()];
+      try {
+        await widget.database.saveEntry(
+          widget.date,
+          title: title,
+          elements: placed,
+        );
+        for (var i = 0; i < els.length; i++) {
+          els[i].dbId = placed[i].id;
+        }
+      } catch (_) {
+        // Re-arm so the next tick (or pop) retries, and let the user know.
+        _dirty = true;
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Couldn't save — will retry.")),
+          );
+        }
+      }
+    });
+    _savePending = op.whenComplete(() {
+      if (identical(_savePending, op)) _savePending = null;
+    });
+    return _savePending!;
   }
 
   @override

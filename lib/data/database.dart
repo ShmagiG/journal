@@ -223,8 +223,14 @@ class AppDatabase extends _$AppDatabase {
   ///
   /// Empty elements are dropped. If nothing meaningful remains (no title and no
   /// non-empty element) the entry is deleted (or never created), mirroring the
-  /// old empty-entry cleanup. Elements are rewritten wholesale in one
-  /// transaction, so add/delete/move all persist uniformly.
+  /// old empty-entry cleanup.
+  ///
+  /// Persistence is a **diff**, not a wholesale rewrite: an element with a known
+  /// [PlacedElement.id] updates that row (and only if its columns actually
+  /// changed), a new element is inserted and has its id written back, and rows
+  /// no longer present are deleted. Unchanged elements — notably strokes with
+  /// large point lists — are never re-serialized to disk, and a save with no
+  /// real change performs zero writes.
   Future<void> saveEntry(
     DateTime day, {
     String? title,
@@ -241,11 +247,17 @@ class AppDatabase extends _$AppDatabase {
 
       if (kept.isEmpty && normalizedTitle == null) {
         if (existing != null) await deleteEntry(existing.id);
+        for (final e in elements) {
+          e.id = null;
+        }
         return;
       }
 
       final preview = _previewFor(kept);
       final int entryId;
+      // Tracks whether anything changed, so the entry row (and its updatedAt)
+      // is only touched when there's a real edit.
+      var changed = false;
       if (existing == null) {
         entryId = await into(entries).insert(
           EntriesCompanion.insert(
@@ -254,8 +266,76 @@ class AppDatabase extends _$AppDatabase {
             preview: Value(preview),
           ),
         );
+        changed = true;
       } else {
         entryId = existing.id;
+      }
+
+      // Current rows for this entry, keyed by id, to diff against.
+      final currentRows =
+          await (select(this.elements)
+                ..where((t) => t.entryId.equals(entryId)))
+              .get();
+      final byId = {for (final r in currentRows) r.id: r};
+      final keptIds = <int>{};
+
+      for (final el in elements) {
+        if (el.data.isEmpty) {
+          // Not persisted; its old row (if any) is removed in the sweep below.
+          el.id = null;
+          continue;
+        }
+        final dataJson = jsonEncode(el.data.toJson());
+        final row = el.id == null ? null : byId[el.id];
+        if (row != null) {
+          keptIds.add(el.id!);
+          if (_rowDiffers(row, el, dataJson)) {
+            await (update(this.elements)
+                  ..where((t) => t.id.equals(el.id!)))
+                .write(
+                  ElementsCompanion(
+                    x: Value(el.x),
+                    y: Value(el.y),
+                    width: Value(el.width),
+                    height: Value(el.height),
+                    z: Value(el.z),
+                    type: Value(el.data.type),
+                    data: Value(dataJson),
+                  ),
+                );
+            changed = true;
+          }
+        } else {
+          final newId = await into(this.elements).insert(
+            ElementsCompanion.insert(
+              entryId: entryId,
+              x: el.x,
+              y: el.y,
+              width: Value(el.width),
+              height: Value(el.height),
+              z: Value(el.z),
+              type: el.data.type,
+              data: dataJson,
+            ),
+          );
+          el.id = newId;
+          keptIds.add(newId);
+          changed = true;
+        }
+      }
+
+      final toDelete = byId.keys.toSet().difference(keptIds);
+      if (toDelete.isNotEmpty) {
+        await (delete(this.elements)..where((t) => t.id.isIn(toDelete))).go();
+        changed = true;
+      }
+
+      // Only rewrite the entry row (bumping updatedAt) when something actually
+      // changed — a no-op save leaves the whole table untouched.
+      if (existing != null &&
+          (changed ||
+              existing.title != normalizedTitle ||
+              existing.preview != preview)) {
         await (update(entries)..where((t) => t.id.equals(entryId))).write(
           EntriesCompanion(
             title: Value(normalizedTitle),
@@ -264,26 +344,19 @@ class AppDatabase extends _$AppDatabase {
           ),
         );
       }
-
-      await (delete(this.elements)..where((t) => t.entryId.equals(entryId)))
-          .go();
-      for (var i = 0; i < kept.length; i++) {
-        final el = kept[i];
-        await into(this.elements).insert(
-          ElementsCompanion.insert(
-            entryId: entryId,
-            x: el.x,
-            y: el.y,
-            width: Value(el.width),
-            height: Value(el.height),
-            z: Value(el.z),
-            type: el.data.type,
-            data: jsonEncode(el.data.toJson()),
-          ),
-        );
-      }
     });
   }
+
+  /// Whether [row] on disk differs from the in-memory [el]/[dataJson] in any
+  /// persisted column, i.e. whether an UPDATE is actually needed.
+  static bool _rowDiffers(Element row, PlacedElement el, String dataJson) =>
+      row.x != el.x ||
+      row.y != el.y ||
+      row.width != el.width ||
+      row.height != el.height ||
+      row.z != el.z ||
+      row.type != el.data.type ||
+      row.data != dataJson;
 
   Future<void> deleteEntry(int id) {
     return (delete(entries)..where((t) => t.id.equals(id))).go();
