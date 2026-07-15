@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui' show PointMode;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -151,8 +152,10 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
 
   static const double _minOpacity = 0.1;
 
-  // The stroke currently being drawn, in canvas coordinates (null when idle).
-  List<Offset>? _drawing;
+  /// The stroke currently being drawn, in canvas coordinates (null when idle).
+  /// A [ValueNotifier] (not a `setState` field) so that adding a point repaints
+  /// only the isolated live-stroke layer, never the whole element [Stack].
+  final ValueNotifier<List<Offset>?> _liveStroke = ValueNotifier(null);
 
   Size _viewport = Size.zero;
 
@@ -373,22 +376,23 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
 
   void _onPointerDown(PointerDownEvent e) {
     if (_tool != _Tool.draw) return;
-    setState(() => _drawing = [e.localPosition - _canvasOrigin]);
+    // No setState: only the live-stroke layer (which listens to _liveStroke)
+    // needs to repaint, not the element Stack.
+    _liveStroke.value = [e.localPosition - _canvasOrigin];
   }
 
   void _onPointerMove(PointerMoveEvent e) {
-    if (_tool != _Tool.draw || _drawing == null) return;
-    setState(() => _drawing!.add(e.localPosition - _canvasOrigin));
+    if (_tool != _Tool.draw || _liveStroke.value == null) return;
+    // Reassign a new list so the notifier fires; the live-stroke CustomPaint
+    // repaints in isolation.
+    _liveStroke.value = [..._liveStroke.value!, e.localPosition - _canvasOrigin];
   }
 
   void _onPointerUp(PointerUpEvent e) {
-    if (_tool != _Tool.draw || _drawing == null) return;
-    final pts = _drawing!;
-    _drawing = null;
-    if (pts.isEmpty) {
-      setState(() {});
-      return;
-    }
+    if (_tool != _Tool.draw || _liveStroke.value == null) return;
+    final pts = _liveStroke.value!;
+    _liveStroke.value = null;
+    if (pts.isEmpty) return;
     final pad = _penWidth / 2 + 1;
     var minX = pts.first.dx, minY = pts.first.dy;
     var maxX = pts.first.dx, maxY = pts.first.dy;
@@ -501,6 +505,7 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
     _transform.dispose();
     _timestampFocus.dispose();
     _canvasFocus.dispose();
+    _liveStroke.dispose();
     for (final el in _elements) {
       el.dispose();
     }
@@ -883,16 +888,26 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                 child: Stack(
                   children: [
                     // Background: catches taps for placing text / deselecting.
+                    // The grid repaints on pan/zoom, so a RepaintBoundary keeps
+                    // those repaints off the element layers.
                     Positioned.fill(
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
                         onTapUp: (d) =>
                             _onCanvasTap(d.localPosition - _canvasOrigin),
-                        child: const _CanvasBackground(),
+                        child: RepaintBoundary(
+                          child: _CanvasBackground(
+                            transform: _transform,
+                            viewport: _viewport,
+                          ),
+                        ),
                       ),
                     ),
                     for (final el in _sortedByZ()) _buildElement(context, el),
-                    if (_drawing != null && _drawing!.isNotEmpty)
+                    // Live drawing preview: mounted whenever the draw tool is
+                    // active and isolated in its own RepaintBoundary, so adding a
+                    // point repaints only this layer (not the element Stack).
+                    if (_tool == _Tool.draw)
                       Positioned.fill(
                         child: IgnorePointer(
                           // The in-progress points are canvas coordinates, so the
@@ -900,11 +915,13 @@ class _EntryEditorScreenState extends State<EntryEditorScreen>
                           // top-left corner.
                           child: Transform.translate(
                             offset: _canvasOrigin,
-                            child: CustomPaint(
-                              painter: _StrokePainter(
-                                _drawing!,
-                                _penColor.withValues(alpha: _penOpacity),
-                                _penWidth,
+                            child: RepaintBoundary(
+                              child: CustomPaint(
+                                painter: _LiveStrokePainter(
+                                  points: _liveStroke,
+                                  color: _penColor.withValues(alpha: _penOpacity),
+                                  width: _penWidth,
+                                ),
                               ),
                             ),
                           ),
@@ -1132,35 +1149,114 @@ class _DragSurface extends StatelessWidget {
 
 /// A faint dotted background so the (otherwise blank) canvas reads as a surface.
 class _CanvasBackground extends StatelessWidget {
-  const _CanvasBackground();
+  const _CanvasBackground({required this.transform, required this.viewport});
+
+  final TransformationController transform;
+  final Size viewport;
 
   @override
   Widget build(BuildContext context) {
     return CustomPaint(
       painter: _GridPainter(
-        Theme.of(context).dividerColor.withValues(alpha: 0.4),
+        color: Theme.of(context).dividerColor.withValues(alpha: 0.4),
+        transform: transform,
+        viewport: viewport,
       ),
     );
   }
 }
 
 class _GridPainter extends CustomPainter {
-  _GridPainter(this.color);
+  _GridPainter({
+    required this.color,
+    required this.transform,
+    required this.viewport,
+  }) : super(repaint: transform);
+
   final Color color;
+  final TransformationController transform;
+  final Size viewport;
+
+  static const double _step = 40.0;
 
   @override
   void paint(Canvas canvas, Size size) {
+    if (viewport.isEmpty) return;
+    // Only the slice of the (huge) surface currently on screen is worth
+    // painting. Map the viewport back into surface coordinates and clamp it to
+    // the surface bounds, then walk only that window's grid.
+    final visible = MatrixUtils.inverseTransformRect(
+      transform.value,
+      Offset.zero & viewport,
+    ).intersect(Offset.zero & size);
+    if (visible.isEmpty) return;
+
+    // Snap the window's edges down to the grid so dots stay aligned.
+    final startX = (visible.left / _step).floor() * _step;
+    final startY = (visible.top / _step).floor() * _step;
+
     final paint = Paint()..color = color;
-    const step = 40.0;
-    for (double x = 0; x < size.width; x += step) {
-      for (double y = 0; y < size.height; y += step) {
+    for (double x = startX; x <= visible.right; x += _step) {
+      for (double y = startY; y <= visible.bottom; y += _step) {
         canvas.drawCircle(Offset(x, y), 0.8, paint);
       }
     }
   }
 
   @override
-  bool shouldRepaint(covariant _GridPainter old) => old.color != color;
+  bool shouldRepaint(covariant _GridPainter old) =>
+      old.color != color || old.viewport != viewport;
+}
+
+/// Paints the in-progress freehand stroke as its points arrive. Listens to
+/// [points] via its `repaint` argument so only this layer repaints per point;
+/// [color]/[width] are fixed for the duration of a stroke.
+class _LiveStrokePainter extends CustomPainter {
+  _LiveStrokePainter({
+    required this.points,
+    required this.color,
+    required this.width,
+  }) : super(repaint: points);
+
+  final ValueListenable<List<Offset>?> points;
+  final Color color;
+  final double width;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final pts = points.value;
+    if (pts == null || pts.isEmpty) return;
+    _paintStrokePath(
+      canvas,
+      pts,
+      Paint()
+        ..color = color
+        ..strokeWidth = width
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveStrokePainter old) =>
+      old.color != color || old.width != width;
+}
+
+/// Draws a freehand stroke (a dot for a single point, a joined path otherwise)
+/// from [points] in the canvas's local space. Shared by the committed-stroke
+/// [_StrokePainter] and the live [_LiveStrokePainter].
+void _paintStrokePath(Canvas canvas, List<Offset> points, Paint paint) {
+  if (points.isEmpty) return;
+  if (points.length == 1) {
+    canvas.drawPoints(PointMode.points, points, paint);
+  } else {
+    final path = Path()..moveTo(points.first.dx, points.first.dy);
+    for (var i = 1; i < points.length; i++) {
+      path.lineTo(points[i].dx, points[i].dy);
+    }
+    canvas.drawPath(path, paint);
+  }
 }
 
 /// Paints a freehand stroke from a list of points (in the painter's local
@@ -1176,25 +1272,16 @@ class _StrokePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (points.isEmpty) return;
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = width
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round
-      ..strokeJoin = StrokeJoin.round;
-    if (points.length == 1) {
-      canvas.drawPoints(
-        PointMode.points,
-        points,
-        paint..strokeCap = StrokeCap.round,
-      );
-    } else {
-      final path = Path()..moveTo(points.first.dx, points.first.dy);
-      for (var i = 1; i < points.length; i++) {
-        path.lineTo(points[i].dx, points[i].dy);
-      }
-      canvas.drawPath(path, paint);
-    }
+    _paintStrokePath(
+      canvas,
+      points,
+      Paint()
+        ..color = color
+        ..strokeWidth = width
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round,
+    );
     if (selected && size.width > 0) {
       canvas.drawRect(
         Offset.zero & size,
