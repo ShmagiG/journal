@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Journal
+Comment=A local-first journal on a free-form canvas
+Exec=@EXEC@
+Icon=io.github.shgh.Journal
+Terminal=false
+Categories=Office;
+Keywords=journal;notes;diary;canvas;
+StartupNotify=true
+StartupWMClass=io.github.shgh.Journal
